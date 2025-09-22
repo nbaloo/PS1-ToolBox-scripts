@@ -3,7 +3,7 @@ Script PowerShell
 Diag Windows – Arrêts et erreurs
 Date : 2025-09-22
 #>
-
+cls
 # === Informations système ===
 $fqdn = [System.Net.Dns]::GetHostByName(($env:COMPUTERNAME)).HostName
 $ips  = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
