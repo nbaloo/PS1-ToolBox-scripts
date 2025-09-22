@@ -1,0 +1,44 @@
+<#
+Script PowerShell
+Diag Windows – Arrêts et erreurs
+Utilisé par Nicolas GRUBER - Tebicom | Généré avec l'aide de ChatGPT (OpenAI)
+Date : 2025-09-22
+#>
+
+# === Informations système ===
+$fqdn = [System.Net.Dns]::GetHostByName(($env:COMPUTERNAME)).HostName
+$ips  = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+         Where-Object { $_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1' }).IPAddress
+
+Write-Host "=== Diagnostic sur $fqdn ===" -ForegroundColor Cyan
+Write-Host "Adresse(s) IP : $($ips -join ', ')" -ForegroundColor Cyan
+Write-Host ""
+
+# === 5 derniers arrêts/reboots ===
+Write-Host "=== 5 derniers arrêts/reboots ===" -ForegroundColor Cyan
+$shutdowns = Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=41 or EventID=1074 or EventID=6006 or EventID=6008)]]" -MaxEvents 5 |
+             Sort-Object TimeCreated -Descending
+
+foreach ($s in $shutdowns) {
+    switch ($s.Id) {
+        1074 { $type = "Arrêt initié (user/process)" }
+        6006 { $type = "Arrêt normal" }
+        6008 { $type = "Arrêt inattendu" }
+        41   { $type = "Arrêt brutal (Kernel-Power)" }
+        default { $type = "Autre" }
+    }
+    Write-Host ("{0:yyyy-MM-dd HH:mm:ss} - {1}" -f $s.TimeCreated, $type) -ForegroundColor Yellow
+}
+
+# === 10 dernières erreurs/critiques ===
+Write-Host "`n=== 10 dernières erreurs/critiques ===" -ForegroundColor Cyan
+$errors = Get-WinEvent -LogName System -MaxEvents 2000 |
+          Where-Object { $_.LevelDisplayName -in 'Error','Critical' } |
+          Sort-Object TimeCreated -Descending |
+          Select-Object -First 10
+
+foreach ($e in $errors) {
+    Write-Host ("{0:yyyy-MM-dd HH:mm:ss} [ID {1}] {2}" -f $e.TimeCreated, $e.Id, $e.ProviderName) -ForegroundColor Yellow
+    Write-Host ("   {0}" -f $e.Message) -ForegroundColor DarkYellow
+    Write-Host ""
+}
