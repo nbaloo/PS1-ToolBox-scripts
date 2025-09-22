@@ -1,0 +1,67 @@
+<#
+Script PowerShell
+ Généré avec l'aide de ChatGPT (OpenAI)
+Date : 22-09-2025 17:15
+Résumé : Affiche les derniers événements RDS/TS (logon, logoff, refusés) avec nom utilisateur + IP source, en couleur
+#>
+
+# === Paramètres ===
+$joursRecherche = 10     # Nombre de jours d’historique à analyser
+$nbResultats    = 10     # Nombre d’événements récents à afficher
+
+# === Informations système ===
+$fqdn = [System.Net.Dns]::GetHostByName(($env:COMPUTERNAME)).HostName
+$ips  = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+         Where-Object { $_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1' }).IPAddress
+
+Write-Host "=== Diagnostic sur $fqdn ===" -ForegroundColor Cyan
+Write-Host "Adresse(s) IP : $($ips -join ', ')" -ForegroundColor Cyan
+Write-Host "Période analysée : $joursRecherche jour(s)" -ForegroundColor Cyan
+Write-Host ""
+
+# Début de la période
+$startTime = (Get-Date).AddDays(-$joursRecherche)
+
+# Récupération des événements pertinents
+$events = Get-WinEvent -FilterHashtable @{
+    LogName = @(
+        "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+        "Security"
+    )
+    StartTime = $startTime
+} | Where-Object {
+    $_.Id -in 21,23,4624,4625
+} | Sort-Object TimeCreated -Descending | Select-Object -First $nbResultats
+
+# Affichage formaté avec couleurs
+foreach ($event in $events) {
+    $user = ""
+    $ip   = ""
+    $type = ""
+    $color = "White"
+
+    switch ($event.Id) {
+        21    { $type = "Logon (RDS)";             $color = "Cyan" }
+        23    { $type = "Logoff (RDS)";            $color = "Yellow" }
+        4624  { $type = "Logon réussi (Security)"; $color = "Green" }
+        4625  { $type = "Logon refusé / Échec";    $color = "Red" }
+        default { $type = "Autre";                 $color = "Gray" }
+    }
+
+    # Extraction simplifiée selon les logs
+    if ($event.Message -match "User\s*=\s*(\S+)") {
+        $user = $matches[1]
+    }
+    elseif ($event.Message -match "Account Name:\s*(\S+)") {
+        $user = $matches[1]
+    }
+
+    if ($event.Message -match "Source Network Address:\s*(\S+)") {
+        $ip = $matches[1]
+    }
+
+    $output = ("{0} | {1} | User: {2} | IP: {3}" -f `
+                $event.TimeCreated, $type, $user, ($ip -ne "" ? $ip : "N/A"))
+
+    Write-Host $output -ForegroundColor $color
+}
