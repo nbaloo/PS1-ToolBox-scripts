@@ -1,67 +1,133 @@
 <#
 Script PowerShell
- Généré avec l'aide de ChatGPT (OpenAI)
-Date : 22-09-2025 17:15
-Résumé : Affiche les derniers événements RDS/TS (logon, logoff, refusés) avec nom utilisateur + IP source, en couleur
+Affiche Logon (21), Logoff (23) et Échec logon (4625) avec User + IP + Reason (via code NTSTATUS)
 #>
-
-# === Paramètres ===
-$joursRecherche = 10     # Nombre de jours d’historique à analyser
-$nbResultats    = 10     # Nombre d’événements récents à afficher
+cls
+# Paramètres
+$nbEvents = 20   # Nombre total d’événements à afficher
+$joursRecherche = 5
+$fetchFactor  = 5  # marge pour récupérer un peu plus d'événements que nécessaire
 
 # === Informations système ===
 $fqdn = [System.Net.Dns]::GetHostByName(($env:COMPUTERNAME)).HostName
 $ips  = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
          Where-Object { $_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1' }).IPAddress
 
-Write-Host "=== Diagnostic sur $fqdn ===" -ForegroundColor Cyan
+Write-Host "=== Extraction connexion session sur $fqdn ===" -ForegroundColor Cyan
 Write-Host "Adresse(s) IP : $($ips -join ', ')" -ForegroundColor Cyan
-Write-Host "Période analysée : $joursRecherche jour(s)" -ForegroundColor Cyan
 Write-Host ""
 
-# Début de la période
+# Table de correspondance des codes d’échec (NTSTATUS -> description FR)
+$reasonMap = @{
+    "0xc000006d" = "Nom ou mot de passe incorrect"
+    "0xc000006e" = "Nom d’utilisateur inconnu"
+    "0xc000006a" = "Mot de passe incorrect"
+    "0xc000006f" = "Compte verrouillé"
+    "0xc0000070" = "Connexion hors plage horaire autorisée"
+    "0xc0000071" = "Mot de passe expiré"
+    "0xc0000072" = "Compte désactivé"
+    "0xc0000193" = "Compte expiré"
+    "0xc0000225" = "Type de logon non valide"
+    "0xc0000064" = "Nom d’utilisateur inexistant (domaine?)"
+    "0xc0000068" = "Tentative depuis une machine non autorisée"
+    "0xc000015b" = "Utilisateur non autorisé à se connecter"
+    "0xc0000073" = "Mot de passe doit être changé"
+    "0xc0000123" = "Erreur de profil / données utilisateur"
+    "0xc000006c" = "Compte expiré / credentials invalides"
+    "0xc00002ee" = "Erreur de confiance / restriction de compte"
+    "0xc0000234" = "Compte verrouillé par la stratégie de sécurité"
+    "0xc0000022" = "Accès refusé (droit d’ouverture de session manquant ou interdit)"
+}
+
+# Fenêtre temporelle
 $startTime = (Get-Date).AddDays(-$joursRecherche)
+$maxToFetch = $nbEvents * $fetchFactor
 
-# Récupération des événements pertinents
-$events = Get-WinEvent -FilterHashtable @{
-    LogName = @(
-        "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
-        "Security"
-    )
-    StartTime = $startTime
-} | Where-Object {
-    $_.Id -in 21,23,4624,4625
-} | Sort-Object TimeCreated -Descending | Select-Object -First $nbResultats
+# Collecte RDS (21/23) → seulement si le log existe
+$rdsEvents = @()
+if (Get-WinEvent -ListLog "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" -ErrorAction SilentlyContinue) {
+    $rdsEvents = Get-WinEvent -FilterHashtable @{
+        LogName   = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
+        Id        = 21,23
+        StartTime = $startTime
+    } -MaxEvents $maxToFetch
+}
 
-# Affichage formaté avec couleurs
+# Collecte Security (4625 uniquement)
+$secEvents = @()
+if (Get-WinEvent -ListLog "Security" -ErrorAction SilentlyContinue) {
+    $secEvents = Get-WinEvent -FilterHashtable @{
+        LogName   = "Security"
+        Id        = 4625
+        StartTime = $startTime
+    } -MaxEvents $maxToFetch
+}
+
+# Fusion + tri + limite
+$events = @($rdsEvents + $secEvents) | Sort-Object TimeCreated -Descending | Select-Object -First $nbEvents
+
+# En-tête
+Write-Host ("{0,-20} | {1,-5} | {2,-18} | {3,-28} | {4,-15} | {5}" -f "Date","ID","Action","User","IP","Reason") -ForegroundColor Cyan
+Write-Host ("-"*130) -ForegroundColor Cyan
+
 foreach ($event in $events) {
-    $user = ""
-    $ip   = ""
-    $type = ""
-    $color = "White"
+    $action = ""
+    $color  = "Gray"
+    $reason = ""
 
     switch ($event.Id) {
-        21    { $type = "Logon (RDS)";             $color = "Cyan" }
-        23    { $type = "Logoff (RDS)";            $color = "Yellow" }
-        4624  { $type = "Logon réussi (Security)"; $color = "Green" }
-        4625  { $type = "Logon refusé / Échec";    $color = "Red" }
-        default { $type = "Autre";                 $color = "Gray" }
+        21    { $action = "Logon";        $color = "Green" }
+        23    { $action = "Logoff";       $color = "Yellow" }
+        4625  { $action = "Échec logon";  $color = "Red" }
     }
 
-    # Extraction simplifiée selon les logs
-    if ($event.Message -match "User\s*=\s*(\S+)") {
-        $user = $matches[1]
-    }
-    elseif ($event.Message -match "Account Name:\s*(\S+)") {
-        $user = $matches[1]
+    # Extraction User
+    $user = "N/A"
+    foreach ($p in @(
+        'Account Name:\s*([^\r\n|]+)',
+        'TargetUserName:\s*([^\r\n|]+)',
+        'Utilisateur\s*:\s*([^\r\n|]+)',
+        'User Name:\s*([^\r\n|]+)',
+        'User\s*:\s*([^\r\n|]+)'
+    )) { if ($event.Message -match $p) { $user = $matches[1].Trim(); break } }
+
+    # Extraction IP
+    $ip = "N/A"
+    foreach ($p in @(
+        'Source Network Address:\s*([^\s\r\n|]+)',
+        'IpAddress"\s*>\s*([^<]+)<',
+        'Adresse réseau source\s*:\s*([^\s\r\n|]+)'
+    )) { if ($event.Message -match $p) { $ip = $matches[1].Trim(); break } }
+
+    # Extraction Reason (par code uniquement)
+    if ($event.Id -eq 4625) {
+        $code = $null
+        if ($event.Message -match "Status:\s*(0x[0-9A-Fa-f]+)") { $code = $matches[1].ToLower() }
+        elseif ($event.Message -match "Sub Status:\s*(0x[0-9A-Fa-f]+)") { $code = $matches[1].ToLower() }
+        elseif ($event.Message -match "État\s*:\s*(0x[0-9A-Fa-f]+)") { $code = $matches[1].ToLower() }
+
+        if ($code) {
+            if ($reasonMap.ContainsKey($code)) {
+                $reason = $reasonMap[$code]
+            } else {
+                $reason = $code
+            }
+        } else {
+            $reason = "N/A"
+        }
     }
 
-    if ($event.Message -match "Source Network Address:\s*(\S+)") {
-        $ip = $matches[1]
-    }
+    # Normalisation
+    if ([string]::IsNullOrWhiteSpace($user))   { $user = "N/A" }
+    if ([string]::IsNullOrWhiteSpace($ip))     { $ip = "N/A" }
+    if ([string]::IsNullOrWhiteSpace($reason)) { $reason = "" }
 
-    $output = ("{0} | {1} | User: {2} | IP: {3}" -f `
-                $event.TimeCreated, $type, $user, ($ip -ne "" ? $ip : "N/A"))
+    # Affichage
+    $line = "{0,-20} | {1,-5} | {2,-18} | {3,-28} | {4,-15} | {5}" -f `
+        $event.TimeCreated.ToString("dd.MM.yyyy HH:mm:ss"), $event.Id, $action, $user, $ip, $reason
 
-    Write-Host $output -ForegroundColor $color
+    Write-Host $line -ForegroundColor $color
 }
+
+Write-Host ""
+Write-Host "Affichage limité aux $nbEvents derniers événements (fenêtre $joursRecherche jours)." -ForegroundColor Cyan
