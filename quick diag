@@ -26,6 +26,19 @@ catch {
     $rapportPath = $null
 }
 
+# ====================================================================
+# INIT : Mesure CPU en arrière-plan
+# ====================================================================
+$SampleInterval = 1   # secondes entre mesures
+$SampleCount    = 10  # durée totale = 10s
+
+$cpuJob = Start-Job -ScriptBlock {
+    param($SampleInterval,$SampleCount)
+    $samples = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval $SampleInterval -MaxSamples $SampleCount
+    $avg = ($samples.CounterSamples.CookedValue | Measure-Object -Average).Average
+    [math]::Round($avg,1)
+} -ArgumentList $SampleInterval,$SampleCount
+
 
 # ====================================================================
 # BLOC 1 : INFOS SYSTEME
@@ -322,7 +335,7 @@ Write-Host "`n=== Partages locaux définis sur cette machine ===" -ForegroundCol
 try {
     $shares = Get-SmbShare | Where-Object { $_.Name -notin @("IPC$") }
     if ($shares) {
-        $shares | Select-Object Name, Path, Description, ShareType | Format-Table -AutoSize
+        ($shares | Select-Object Name, Path, Description, ShareType | Format-Table -AutoSize | Out-String).Trim() | Write-Host
     }
     else {
         Write-Host "Aucun partage local trouvé." -ForegroundColor Green
@@ -338,18 +351,26 @@ catch {
 Write-Host "`n=== Lecteurs réseau montés (net use) ===" -ForegroundColor Cyan
 try {
     $mappings = Get-SmbMapping -ErrorAction SilentlyContinue
-    if (-not $mappings) { $mappings = net use | Out-String }
-    
+
     if ($mappings) {
-        if ($mappings -is [string]) {
-            Write-Host $mappings
-        }
-        else {
-            $mappings | Select-Object LocalPath, RemotePath, Status | Format-Table -AutoSize
-        }
+        ($mappings | Select-Object LocalPath, RemotePath, Status | Format-Table -AutoSize | Out-String).Trim() | Write-Host
     }
     else {
-        Write-Host "Aucun lecteur réseau actuellement connecté." -ForegroundColor Green
+        $raw = net use 2>$null
+        $lines = $raw | Where-Object { $_ -match "^[A-Z]:" }
+        if ($lines) {
+            ($lines | ForEach-Object {
+                $parts = ($_ -split "\s+") -ne ""
+                [PSCustomObject]@{
+                    Lecteur = $parts[0]
+                    Cible   = $parts[1]
+                    Etat    = $parts[-1]
+                }
+            } | Format-Table -AutoSize | Out-String).Trim() | Write-Host
+        }
+        else {
+            Write-Host "Aucun lecteur réseau actuellement connecté." -ForegroundColor Green
+        }
     }
 }
 catch {
@@ -404,39 +425,55 @@ catch {
 # ====================================================================
 Write-Host "`n=== Santé Matériel & Ressources ===" -ForegroundColor Cyan
 
-# CPU Utilisation
+# --- CPU : moyenne courte ---
 try {
-    $cpuLoad = (Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop).CounterSamples.CookedValue
-    $cpuLoad = [math]::Round($cpuLoad,1)
-    Write-Host ("CPU Utilisation : {0:N1} %" -f $cpuLoad)
+    $cpuSamples = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 -ErrorAction Stop
+    $cpuAvg = ($cpuSamples.CounterSamples.CookedValue | Measure-Object -Average).Average
+    $cpuAvg = [math]::Round($cpuAvg,1)
+    Write-Host ("CPU Utilisation : {0:N1} %" -f $cpuAvg)
 }
 catch {
     try {
-        $cpuLoad = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
-        Write-Host ("CPU Utilisation (fallback) : {0:N1} %" -f $cpuLoad)
+        $cpuAvg = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        if ($cpuAvg -ne $null) {
+            Write-Host ("CPU Utilisation (approx.) : {0:N1} %" -f $cpuAvg)
+        }
+        else {
+            Write-Host "CPU Utilisation : Indisponible" -ForegroundColor Yellow
+        }
     }
     catch {
-        Write-Host "CPU Utilisation : Non accessible" -ForegroundColor Yellow
+        Write-Host "CPU Utilisation : Indisponible" -ForegroundColor Yellow
     }
 }
 
-# RAM Utilisation
+# --- RAM ---
 try {
     $ram = Get-CimInstance Win32_OperatingSystem
-    $ramFreeGB = [math]::Round($ram.FreePhysicalMemory/1MB,2)
+    $ramFreeGB  = [math]::Round($ram.FreePhysicalMemory/1MB,2)
     $ramTotalGB = [math]::Round($ram.TotalVisibleMemorySize/1MB,2)
-    Write-Host ("RAM Utilisation : {0} / {1} Go" -f ($ramTotalGB-$ramFreeGB), $ramTotalGB)
+    $ramUsedGB  = [math]::Round($ramTotalGB - $ramFreeGB,2)
+    Write-Host ("RAM Utilisation : {0} / {1} Go" -f $ramUsedGB, $ramTotalGB)
 }
-catch { Write-Host "RAM Utilisation : Non accessible" -ForegroundColor Yellow }
+catch {
+    Write-Host "RAM Utilisation : Indisponible" -ForegroundColor Yellow
+}
 
-# Disques
+# --- Disques ---
 try {
     Get-PSDrive -PSProvider FileSystem | ForEach-Object {
-        $pct = [math]::Round(($_.Used/($_.Used + $_.Free))*100,1)
-        Write-Host ("Disque {0} : {1:N1} Go libres ({2}% utilisé)" -f $_.Name, ($_.Free/1GB), $pct)
+        $total = $_.Used + $_.Free
+        if ($total -gt 0) {
+            $pctUsed = [math]::Round(($_.Used / $total) * 100,1)
+            $freeGB  = [math]::Round($_.Free/1GB,1)
+            Write-Host ("Disque {0} : {1} Go libres ({2}% utilisé)" -f $_.Name, $freeGB, $pctUsed)
+        }
     }
 }
-catch { Write-Host "Stockage : Non accessible" -ForegroundColor Yellow }
+catch {
+    Write-Host "Stockage : Indisponible" -ForegroundColor Yellow
+}
+
 
 
 # ====================================================================
@@ -568,6 +605,39 @@ catch {
     Write-Host "Impossible de déterminer la version d’Office." -ForegroundColor Yellow
 }
 
+# ====================================================================
+# BLOC 11d : FICHIERS PST / OST (taille & emplacement)
+# ====================================================================
+Write-Host "`n=== Fichiers Outlook PST / OST ===" -ForegroundColor Cyan
+
+# Dossiers standards utilisés par Outlook (profil courant uniquement)
+$paths = @(
+    "$env:USERPROFILE\AppData\Local\Microsoft\Outlook",
+    "$env:USERPROFILE\Documents\Outlook Files"
+)
+
+try {
+    $files = @()
+
+    foreach ($p in $paths) {
+        if (Test-Path $p) {
+            $found = Get-ChildItem -Path $p -Include *.ost, *.pst -Recurse -ErrorAction SilentlyContinue
+            if ($found) { $files += $found }
+        }
+    }
+
+    if ($files.Count -gt 0) {
+        $files | Select-Object FullName,@{Name="Taille (Go)";Expression={[math]::Round($_.Length / 1GB,2)}} | 
+            Format-Table -AutoSize
+    }
+    else {
+        Write-Host "Aucun fichier PST/OST trouvé dans le profil courant." -ForegroundColor Yellow
+    }
+}
+catch {
+    Write-Host "⚠️ Erreur lors du scan des fichiers PST/OST : $($_.Exception.Message)" -ForegroundColor Red
+}
+
 
 # ====================================================================
 # BLOC 12 : EVENT VIEWER
@@ -653,9 +723,12 @@ catch {
     Write-Host "Impossible de récupérer les périphériques." -ForegroundColor Yellow
 }
 
-
 # ====================================================================
 # FIN DU DIAGNOSTIC
 # ====================================================================
-Stop-Transcript | Out-Null
-Write-Host "`nRapport complet exporté vers : $rapportPath" -ForegroundColor Cyan
+try {  Stop-Transcript | Out-Null}
+catch {   Write-Host "⚠️ Aucun transcript actif à arrêter." -ForegroundColor Yellow}
+
+if ($rapportPath -ne $null) {
+    Write-Host "`nRapport complet exporté vers : $rapportPath" -ForegroundColor Cyan}
+else {   Write-Host "Fin du diagnostic" -ForegroundColor Cyan}
