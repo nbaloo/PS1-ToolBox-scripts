@@ -1,0 +1,661 @@
+<#
+Script PowerShell
+Utilisé par Nicolas GRUBER - Tebicom | Généré avec l'aide de ChatGPT (OpenAI)
+Date : 27.09.2025
+Résumé : Diagnostic complet Windows Server / Endpoint (user+admin compatible)
+#>
+
+cls
+
+# ====================================================================
+# INITIALISATION : TRANSCRIPT GLOBAL
+# ====================================================================
+try {
+    if ($MyInvocation.MyCommand.Path) {
+        $ScriptPath  = Split-Path -Parent $MyInvocation.MyCommand.Path
+        $rapportPath = Join-Path $ScriptPath ("Diagnostic-Windows-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmm'))
+        Start-Transcript -Path $rapportPath -Force | Out-Null
+    }
+    else {
+        Write-Host "⚠️ Script lancé depuis la console/ISE → Pas de chemin pour export." -ForegroundColor Yellow
+        $rapportPath = $null
+    }
+}
+catch {
+    Write-Host "⚠️ Impossible de démarrer le transcript (erreur d’écriture)." -ForegroundColor Yellow
+    $rapportPath = $null
+}
+
+
+# ====================================================================
+# BLOC 1 : INFOS SYSTEME
+# ====================================================================
+Write-Host "=== Diagnostic Complet Windows Server / Endpoint ===" -ForegroundColor Cyan
+$FQDN = [System.Net.Dns]::GetHostByName(($env:computerName)).HostName
+$OS   = Get-CimInstance Win32_OperatingSystem
+$LastUpdate = Get-HotFix | Sort-Object -Property InstalledOn -Descending | Select-Object -First 1
+$LastReboot = $OS.LastBootUpTime
+
+function Get-WindowsRelease {
+    param([string]$BuildNumber)
+    switch ($BuildNumber) {
+        {$_ -gt 26100} { return "Version trop récente pour le script (build $BuildNumber)" }
+        {$_ -ge 26100} { return "24H2" }
+        {$_ -ge 22631} { return "23H2" }
+        {$_ -ge 22621} { return "22H2" }
+        {$_ -ge 22000} { return "21H2" }
+        {$_ -ge 19045} { return "22H2 (Win10)" }
+        {$_ -ge 19044} { return "21H2 (Win10)" }
+        default { return "Inconnu ($BuildNumber)" }
+    }
+}
+$Release = Get-WindowsRelease -BuildNumber $OS.BuildNumber
+
+Write-Host "Nom FQDN      : $FQDN"
+Write-Host "OS Version    : $($OS.Caption) $Release"
+Write-Host "Dernière MAJ  : $($LastUpdate.InstalledOn)"
+Write-Host "Dernier reboot: $LastReboot"
+
+# ====================================================================
+# BLOC 2B : INTEGRATION ANNUAIRE & OAUTH LOCAL
+# ====================================================================
+Write-Host "`n=== Intégration annuaire / Azure AD / OAuth ===" -ForegroundColor Cyan
+try {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $dsreg = dsregcmd /status 2>$null
+
+    $aadJoin       = ($dsreg -match "AzureAdJoined\s*:\s*YES")
+    $workplaceJoin = ($dsreg -match "WorkplaceJoined\s*:\s*YES")
+    $prtActive     = ($dsreg -match "AzureAdPrt\s*:\s*YES")
+    $domainJoin    = $cs.PartOfDomain
+    $currentUPN    = try { (whoami /upn) } catch { $null }
+
+    if ($domainJoin -and -not $aadJoin) {
+        Write-Host "État machine : Active Directory Join (domaine $($cs.Domain))" -ForegroundColor Green
+        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
+    }
+    elseif ($aadJoin) {
+        Write-Host "État machine : Azure AD Join" -ForegroundColor Green
+        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
+        if ($prtActive)  { Write-Host "PRT (SSO) : Actif" -ForegroundColor Green }
+        else             { Write-Host "PRT (SSO) : Inactif" -ForegroundColor Red }
+    }
+    elseif ($workplaceJoin) {
+        Write-Host "État machine : Workplace Join (Azure AD Registered)" -ForegroundColor Yellow
+        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
+    }
+    else {
+        Write-Host "État machine : Groupe de travail (Workgroup)" -ForegroundColor Red
+        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
+    }
+}
+catch {
+    Write-Host "Non accessible (dsregcmd bloqué ou droits insuffisants)" -ForegroundColor Yellow
+}
+
+
+# ====================================================================
+# BLOC 3 : RESEAU & CONNECTIVITE
+# ====================================================================
+Write-Host "`n=== Réseau & Connectivité ===" -ForegroundColor Cyan
+
+# Domaine utilisé pour tester la résolution DNS
+$DnsTestDomain = "www.microsoft.com"
+$DnsFallback   = "www.google.com"
+
+Write-Host "(Résolution DNS testée sur $DnsTestDomain, fallback $DnsFallback)" -ForegroundColor DarkGray
+
+# Test rapide si le domaine principal répond, sinon fallback
+try {
+    $testRes = Resolve-DnsName $DnsTestDomain -ErrorAction Stop
+}
+catch {
+    Write-Host "⚠️ $DnsTestDomain ne répond pas, utilisation du fallback $DnsFallback" -ForegroundColor Yellow
+    $DnsTestDomain = $DnsFallback
+}
+
+try {
+    $nics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Sort-Object ifIndex
+    if ($nics) {
+        foreach ($nic in $nics) {
+            $ips     = Get-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+            $dns     = (Get-DnsClientServerAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+            $gw      = (Get-NetIPConfiguration -InterfaceIndex $nic.ifIndex -ErrorAction SilentlyContinue).IPv4DefaultGateway.NextHop
+            $profile = Get-NetConnectionProfile -InterfaceIndex $nic.ifIndex -ErrorAction SilentlyContinue
+            $dnsClient = Get-DnsClient -InterfaceIndex $nic.ifIndex -ErrorAction SilentlyContinue
+
+            foreach ($ip in $ips) {
+                Write-Host ("Interface {0} ({1})" -f $nic.Name, $nic.InterfaceDescription) -ForegroundColor Cyan
+                Write-Host ("Adresse IP    : {0}/{1}" -f $ip.IPAddress, $ip.PrefixLength)
+                Write-Host ("Adresse MAC   : {0}" -f $nic.MacAddress)
+
+                if ($profile) {
+                    Write-Host ("Profil réseau : {0}" -f $profile.NetworkCategory)
+                }
+
+                if ($dnsClient -and $dnsClient.ConnectionSpecificSuffix) {
+                    Write-Host ("Suffixe DNS   : {0}" -f $dnsClient.ConnectionSpecificSuffix)
+                }
+
+                # DHCP ou statique
+                if ($ip.AddressState -eq "Preferred") {
+                    if ($ip.PrefixOrigin -eq "Dhcp") {
+                        Write-Host "Mode IP       : DHCP"
+                    } else {
+                        Write-Host "Mode IP       : Statique"
+                    }
+                }
+
+                # --- Passerelles
+                if ($gw) {
+                    foreach ($g in $gw) {
+                        $pingGW = Test-Connection -ComputerName $g -Count 1 -Quiet -ErrorAction SilentlyContinue
+                        if ($pingGW) { Write-Host ("Passerelle    : {0} (ping OK)" -f $g) -ForegroundColor Green }
+                        else         { Write-Host ("Passerelle    : {0} (FAIL)" -f $g) -ForegroundColor Red }
+                    }
+                } else {
+                    Write-Host "Passerelle    : (aucune)" -ForegroundColor Yellow
+                }
+
+                # --- DNS
+                if ($dns) {
+                    Write-Host "Serveur DNS   :"
+                    foreach ($server in $dns) {
+                        try {
+                            $pingResult = Test-Connection -ComputerName $server -Count 1 -ErrorAction SilentlyContinue
+                            if ($pingResult) {
+                                $lat = $pingResult.ResponseTime
+                                $ns = nslookup $DnsTestDomain $server 2>$null
+                                if ($ns -match "Address:") {
+                                    Write-Host ("{0} (ping OK {1} ms) - Résolution DNS : OK" -f $server,$lat) -ForegroundColor Green
+                                } else {
+                                    Write-Host ("{0} (ping OK {1} ms) - Résolution DNS : FAIL" -f $server,$lat) -ForegroundColor Yellow
+                                }
+                            } else {
+                                Write-Host ("{0} (ping FAIL)" -f $server) -ForegroundColor Red
+                            }
+                        }
+                        catch {
+                            Write-Host ("{0} (erreur de test)" -f $server) -ForegroundColor Yellow
+                        }
+                    }
+                }
+                Write-Host ""
+            }
+        }
+    } else {
+        Write-Host "Aucune interface réseau active détectée." -ForegroundColor Yellow
+    }
+
+    # === TESTS INTERNET ===
+    Write-Host "`n=== Tests de connectivité Internet ===" -ForegroundColor Cyan
+    $targets = @("8.8.8.8","www.google.ch")
+
+    foreach ($target in $targets) {
+        try {
+            $remoteIP = $target
+            if ($target -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+                try {
+                    $resolved = [System.Net.Dns]::GetHostAddresses($target) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+                    if ($resolved) { $remoteIP = $resolved.IPAddressToString }
+                } catch { }
+            }
+
+            $result = Test-Connection -ComputerName $remoteIP -Count 4 -ErrorAction SilentlyContinue
+            if ($result) {
+                $avg = [math]::Round(($result | Measure-Object ResponseTime -Average).Average,1)
+                $route = Find-NetRoute -RemoteIPAddress $remoteIP -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1
+                if ($route) {
+                    $nicUsed = (Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue).Name
+                    if (-not $nicUsed) { $nicUsed = "Interface $($route.InterfaceIndex)" }
+                    Write-Host ("Ping {0,-15} : OK (via {1}, moyenne {2} ms)" -f $target,$nicUsed,$avg) -ForegroundColor Green
+                }
+                else {
+                    Write-Host ("Ping {0,-15} : OK (interface inconnue, moyenne {1} ms)" -f $target,$avg) -ForegroundColor Yellow
+                }
+            }
+            else {
+                Write-Host ("Ping {0,-15} : FAIL" -f $target) -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host ("Ping {0,-15} : Erreur de test" -f $target) -ForegroundColor Yellow
+        }
+    }
+}
+catch {
+    Write-Host "Impossible de récupérer les infos réseau." -ForegroundColor Yellow
+}
+
+# --- Routes principales ---
+Write-Host "`n=== Routes majeures (route print) ===" -ForegroundColor Cyan
+try {
+    $routes = Get-NetRoute -AddressFamily IPv4 | Where-Object {
+        $_.DestinationPrefix -eq "0.0.0.0/0" -or
+        $_.DestinationPrefix -like "10.*" -or
+        $_.DestinationPrefix -like "172.1[6-9]*" -or
+        $_.DestinationPrefix -like "172.2[0-9]*" -or
+        $_.DestinationPrefix -like "172.3[0-1]*" -or
+        $_.DestinationPrefix -like "192.168*"
+    } | Sort-Object RouteMetric
+
+    if ($routes) {
+        $routes | ForEach-Object {
+            Write-Host ("{0,-18} | {1,-18} | {2,-25} | Metric {3}" -f `
+                $_.DestinationPrefix, $_.NextHop, $_.InterfaceAlias, $_.RouteMetric)
+        }
+    } else {
+        Write-Host "Aucune route majeure détectée."
+    }
+}
+catch { Write-Host "Impossible de récupérer les routes." -ForegroundColor Yellow }
+
+# --- Extrait du fichier HOSTS ---
+Write-Host "`n=== Extrait du fichier hosts ===" -ForegroundColor Cyan
+try {
+    $hosts = Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" |
+        Where-Object {$_ -match "^\s*[^#]" -and $_.Trim() -ne ""} |
+        Select-Object -First 10
+    if ($hosts) { $hosts | ForEach-Object { Write-Host $_ } }
+    else { Write-Host "Aucune entrée personnalisée détectée." -ForegroundColor Green }
+}
+catch { Write-Host "Impossible de lire le fichier hosts." -ForegroundColor Yellow }
+
+# ====================================================================
+# BLOC 4 : HEURE & NTP
+# ====================================================================
+Write-Host "`n=== Heure & NTP ===" -ForegroundColor Cyan
+$LocalTime = Get-Date
+Write-Host "Heure locale  : $LocalTime"
+
+try {
+    $ntpSource = (w32tm /query /source 2>&1)  # on capture aussi les erreurs
+    if ($LASTEXITCODE -ne 0 -or $ntpSource -match "Acc.s refus.") {
+        Write-Host "NTP Source    : Non accessible (droits admin requis)" -ForegroundColor Yellow
+    }
+    elseif ($ntpSource) {
+        Write-Host "NTP Source    : $ntpSource"
+    }
+    else {
+        Write-Host "NTP Source    : Non disponible" -ForegroundColor Yellow
+    }
+}
+catch {
+    Write-Host "NTP Source    : Non accessible (droits admin requis)" -ForegroundColor Yellow
+}
+
+
+# ====================================================================
+# BLOC 5 : ADMINS LOCAUX
+# ====================================================================
+function Format-Text {
+    param($text, $max)
+    if ($null -eq $text) { return "" }
+    if ($text.Length -gt $max) {
+        return $text.Substring(0, $max-3) + "..."
+    } else {
+        return $text
+    }
+}
+
+Write-Host "`n=== Administrateurs locaux ===" -ForegroundColor Cyan
+try {
+    $LocalAdmins = Get-LocalGroupMember -SID "S-1-5-32-544"
+    if ($LocalAdmins) {
+        foreach ($adm in $LocalAdmins) {
+            $name = Format-Text $adm.Name 40
+            $cls  = Format-Text $adm.ObjectClass 15
+            Write-Host ("{0,-40} | {1}" -f $name, $cls)
+        }
+    }
+    else {
+        Write-Host "Aucun admin local trouvé."
+    }
+}
+catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+
+# ====================================================================
+# BLOC 6a : PARTAGES LOCAUX
+# ====================================================================
+Write-Host "`n=== Partages locaux définis sur cette machine ===" -ForegroundColor Cyan
+try {
+    $shares = Get-SmbShare | Where-Object { $_.Name -notin @("IPC$") }
+    if ($shares) {
+        $shares | Select-Object Name, Path, Description, ShareType | Format-Table -AutoSize
+    }
+    else {
+        Write-Host "Aucun partage local trouvé." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Host "Impossible de récupérer les partages locaux (droits requis ?)" -ForegroundColor Yellow
+}
+
+# ====================================================================
+# BLOC 6b : LECTEURS RÉSEAU CONNECTÉS
+# ====================================================================
+Write-Host "`n=== Lecteurs réseau montés (net use) ===" -ForegroundColor Cyan
+try {
+    $mappings = Get-SmbMapping -ErrorAction SilentlyContinue
+    if (-not $mappings) { $mappings = net use | Out-String }
+    
+    if ($mappings) {
+        if ($mappings -is [string]) {
+            Write-Host $mappings
+        }
+        else {
+            $mappings | Select-Object LocalPath, RemotePath, Status | Format-Table -AutoSize
+        }
+    }
+    else {
+        Write-Host "Aucun lecteur réseau actuellement connecté." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Host "Impossible de récupérer les lecteurs réseau." -ForegroundColor Yellow
+}
+
+
+# ====================================================================
+# BLOC 7 : SESSIONS UTILISATEURS (locale / RDP)
+# ====================================================================
+Write-Host "`n=== Sessions Utilisateurs (locale / RDP) ===" -ForegroundColor Cyan
+try {
+    $sessions = (qwinsta) -split "`r?`n" | Where-Object {$_ -match "console|rdp"}
+    $logons = Get-CimInstance Win32_LoggedOnUser | ForEach-Object {
+        $u = $_.Antecedent.ToString()
+        if ($u -match 'Domain="(.+)",Name="(.+)"') {
+            [PSCustomObject]@{
+                Domain = $matches[1]
+                User   = $matches[2]
+            }
+        }
+    }
+
+    if ($sessions) {
+        foreach ($s in $sessions) {
+            $parts = ($s -split '\s+') -ne ''
+            $sessionName = $parts[0]
+            $userNT      = $parts[1]
+            $id          = $parts[2]
+            $state       = $parts[3]
+
+            $resolved = $logons | Where-Object { $_.User -eq $userNT } | Select-Object -First 1
+            if ($resolved) {
+                $userDisplay = "$($resolved.User) ($($resolved.Domain))"
+            } else {
+                $userDisplay = $userNT
+            }
+
+            Write-Host ("{0,-20} {1,-35} {2,-3} {3}" -f $sessionName, $userDisplay, $id, $state)
+        }
+    } else {
+        Write-Host "Aucune session détectée."
+    }
+}
+catch {
+    Write-Host "Impossible de récupérer les sessions." -ForegroundColor Yellow
+}
+
+
+# ====================================================================
+# BLOC 8 : SANTE MATERIEL & RESSOURCES
+# ====================================================================
+Write-Host "`n=== Santé Matériel & Ressources ===" -ForegroundColor Cyan
+
+# CPU Utilisation
+try {
+    $cpuLoad = (Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop).CounterSamples.CookedValue
+    $cpuLoad = [math]::Round($cpuLoad,1)
+    Write-Host ("CPU Utilisation : {0:N1} %" -f $cpuLoad)
+}
+catch {
+    try {
+        $cpuLoad = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        Write-Host ("CPU Utilisation (fallback) : {0:N1} %" -f $cpuLoad)
+    }
+    catch {
+        Write-Host "CPU Utilisation : Non accessible" -ForegroundColor Yellow
+    }
+}
+
+# RAM Utilisation
+try {
+    $ram = Get-CimInstance Win32_OperatingSystem
+    $ramFreeGB = [math]::Round($ram.FreePhysicalMemory/1MB,2)
+    $ramTotalGB = [math]::Round($ram.TotalVisibleMemorySize/1MB,2)
+    Write-Host ("RAM Utilisation : {0} / {1} Go" -f ($ramTotalGB-$ramFreeGB), $ramTotalGB)
+}
+catch { Write-Host "RAM Utilisation : Non accessible" -ForegroundColor Yellow }
+
+# Disques
+try {
+    Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+        $pct = [math]::Round(($_.Used/($_.Used + $_.Free))*100,1)
+        Write-Host ("Disque {0} : {1:N1} Go libres ({2}% utilisé)" -f $_.Name, ($_.Free/1GB), $pct)
+    }
+}
+catch { Write-Host "Stockage : Non accessible" -ForegroundColor Yellow }
+
+
+# ====================================================================
+# BLOC 9 : SECURITE
+# ====================================================================
+Write-Host "`n=== Sécurité ===" -ForegroundColor Cyan
+try {
+    $av = Get-MpComputerStatus -ErrorAction SilentlyContinue
+    if ($av) { Write-Host "Antivirus (Defender) : $($av.AntivirusEnabled)" }
+    else { Write-Host "Antivirus : Non accessible" -ForegroundColor Yellow }
+}
+catch { Write-Host "Antivirus : Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+(Get-NetFirewallProfile) | ForEach-Object {
+    Write-Host "Pare-feu $($_.Name) : $($_.Enabled)"
+}
+
+try {
+    $bl = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object {$_.VolumeType -eq "OperatingSystem"}
+    if ($bl) { Write-Host "BitLocker : $($bl.ProtectionStatus)" }
+    else { Write-Host "BitLocker : Non disponible" }
+}
+catch { Write-Host "BitLocker : Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+
+# ====================================================================
+# BLOC 10 : SERVICES (CRITIQUES + AUTRES)
+# ====================================================================
+
+function Format-Text {
+    param($text, $max)
+    if ($null -eq $text) { return "" }
+    if ($text.Length -gt $max) {
+        return $text.Substring(0, $max-3) + "..."
+    } else {
+        return $text
+    }
+}
+
+Write-Host "`n=== Services Critiques Windows (OFF) ===" -ForegroundColor Cyan
+$CriticalServices = @(
+    "wuauserv","Dnscache","LanmanWorkstation","LanmanServer","EventLog","Schedule","WinRM",
+    "TermService","SessionEnv","UmRdpService","Spooler",
+    "NTDS","Netlogon","DFSR","KDC","DNS","DHCPServer","WINS",
+    "W32Time","BITS","SamSs","WinDefend"
+)
+
+try {
+    $CriticalStopped = Get-Service | Where-Object {
+        $_.StartType -eq "Automatic" -and $_.Status -ne "Running" -and
+        ($CriticalServices -contains $_.Name)
+    }
+    if ($CriticalStopped) {
+        foreach ($svc in $CriticalStopped) {
+            $name  = Format-Text $svc.Name 15
+            $dname = Format-Text $svc.DisplayName 40
+            Write-Host ("{0,-15} | {1,-40} | {2}" -f $name, $dname, $svc.Status)
+        }
+    } else {
+        Write-Host "Tous les services critiques Windows sont démarrés." -ForegroundColor Green
+    }
+}
+catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+Write-Host "`n=== Autres Services Automatiques (OFF) ===" -ForegroundColor Cyan
+try {
+    $OtherStopped = Get-Service | Where-Object {
+        $_.StartType -eq "Automatic" -and $_.Status -ne "Running" -and
+        ($CriticalServices -notcontains $_.Name)
+    }
+    if ($OtherStopped) {
+        foreach ($svc in $OtherStopped) {
+            $name  = Format-Text $svc.Name 15
+            $dname = Format-Text $svc.DisplayName 40
+            Write-Host ("{0,-15} | {1,-40} | {2}" -f $name, $dname, $svc.Status)
+        }
+        Write-Host "⚠️ Vérifier si ces services métiers doivent être démarrés." -ForegroundColor Yellow
+    } else {
+        Write-Host "Aucun autre service automatique arrêté." -ForegroundColor Green
+    }
+}
+catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+
+
+
+# ====================================================================
+# BLOC 11 : WINDOWS UPDATE
+# ====================================================================
+Write-Host "`n=== Windows Update ===" -ForegroundColor Cyan
+try {
+    $WUReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    if ($WUReboot) { Write-Host "⚠️ Redémarrage en attente !" -ForegroundColor Red }
+    else { Write-Host "Pas de redémarrage en attente." -ForegroundColor Green }
+}
+catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+# ====================================================================
+# BLOC 11b : MICROSOFT OFFICE
+# ====================================================================
+Write-Host "`n=== Microsoft Office ===" -ForegroundColor Cyan
+try {
+    $officeRegPath1 = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+    $officeRegPath2 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
+    $officeKey = $null
+
+    if (Test-Path $officeRegPath1) { $officeKey = Get-ItemProperty $officeRegPath1 }
+    elseif (Test-Path $officeRegPath2) { $officeKey = Get-ItemProperty $officeRegPath2 }
+
+    if ($officeKey) {
+        $ver   = $officeKey.VersionToReport
+        $arch  = $officeKey.Platform
+        $prod  = $officeKey.ProductReleaseIds
+
+        # Vérification si version >= Office 2016
+        if ($ver -match "^16\." ) {
+            Write-Host "Version détectée : $ver ($arch)" -ForegroundColor Green
+            if ($prod) { Write-Host "Édition : $prod" }
+        }
+        else {
+            Write-Host "Pas de version Office 2016 ou sup trouvée." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "Pas de version Office 2016 ou sup trouvée." -ForegroundColor Yellow
+    }
+}
+catch {
+    Write-Host "Impossible de déterminer la version d’Office." -ForegroundColor Yellow
+}
+
+
+# ====================================================================
+# BLOC 12 : EVENT VIEWER
+# ====================================================================
+Write-Host "`n=== Analyse Event Viewer (24 dernières heures) ===" -ForegroundColor Cyan
+$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+if (-not $IsAdmin) {
+    Write-Warning "Le script n'est pas lancé en Administrateur."
+} else {
+    $Since = (Get-Date).AddHours(-24)
+    $MainLogs = @("System","Application","Security","Setup")
+    $Events24h = foreach ($log in $MainLogs) {
+        Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$Since} -MaxEvents 500 -ErrorAction SilentlyContinue
+    }
+    $CountCritical = ($Events24h | Where-Object { $_.Level -eq 1 }).Count
+    $CountError    = ($Events24h | Where-Object { $_.Level -eq 2 }).Count
+    Write-Host "Critiques (24h): $CountCritical"
+    Write-Host "Erreurs   (24h): $CountError"
+    Write-Host "--- 10 dernières ERREURS (synthèse) ---" -ForegroundColor Yellow
+    $LastErrors = $Events24h | Where-Object { $_.Level -eq 2 } |
+        Sort-Object TimeCreated -Descending |
+        Select-Object -First 10 TimeCreated, ProviderName, LogName, Message
+    foreach ($err in $LastErrors) {
+        $msg = $err.Message -replace '\r?\n',' ' -replace '\s+',' '
+        $msg = $msg.Trim()
+        if ($msg.Length -gt 100) { $msg = $msg.Substring(0,100) + "..." }
+        Write-Host ("[{0}] | Source:{1} | Log:{2} | {3}" -f `
+            $err.TimeCreated, $err.ProviderName, $err.LogName, $msg)
+    }
+}
+
+# ====================================================================
+# BLOC 13 : TEMPERATURE CPU
+# ====================================================================
+Write-Host "`n=== Température CPU ===" -ForegroundColor Cyan
+try {
+    $temps = Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction Stop
+    $zonesUtiles = $temps | Where-Object { $_.InstanceName -match "CPU|GFX|PCH" }
+    if ($zonesUtiles) {
+        foreach ($t in $zonesUtiles) {
+            $celsius = ($t.CurrentTemperature / 10) - 273.15
+            $msg = ("Zone: {0,-20} | Temp: {1,5:N1} °C" -f $t.InstanceName, $celsius)
+            if ($celsius -lt 60) { Write-Host $msg -ForegroundColor Green }
+            elseif ($celsius -lt 80) { Write-Host $msg -ForegroundColor Yellow }
+            else { Write-Host $msg -ForegroundColor Red }
+        }
+    } else {
+        Write-Host "Non disponible (pas de capteur)" -ForegroundColor Yellow
+    }
+}
+catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+# ====================================================================
+# BLOC 14 : SMART DISQUES
+# ====================================================================
+Write-Host "`n=== État SMART des disques ===" -ForegroundColor Cyan
+try {
+    $disks = Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction Stop
+    if ($disks -and $disks.Count -gt 0) {
+        foreach ($d in $disks) {
+            Write-Host ("{0,-20} | État: {1,-10} | Secteurs réalloués: {2}" -f `
+                $d.FriendlyName, $d.HealthStatus, $d.ReallocatedSectorsCount)
+        }
+    } else { Write-Host "Aucun disque compatible SMART détecté." }
+}
+catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
+
+# ====================================================================
+# BLOC 15 : PERIPHERIQUES EN ERREUR (CRITIQUES UNIQUEMENT)
+# ====================================================================
+Write-Host "`n=== Périphériques en erreur (drivers) ===" -ForegroundColor Cyan
+try {
+    $badDevices = Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 }
+    if ($badDevices) {
+        foreach ($dev in $badDevices) {
+            Write-Host ("{0} | Code: {1}" -f $dev.Name, $dev.ConfigManagerErrorCode)
+        }
+    } else {
+        Write-Host "Aucun périphérique en erreur détecté." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Host "Impossible de récupérer les périphériques." -ForegroundColor Yellow
+}
+
+
+# ====================================================================
+# FIN DU DIAGNOSTIC
+# ====================================================================
+Stop-Transcript | Out-Null
+Write-Host "`nRapport complet exporté vers : $rapportPath" -ForegroundColor Cyan
