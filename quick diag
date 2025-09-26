@@ -2,15 +2,19 @@
 Script PowerShell
 Utilisé par Nicolas GRUBER - Tebicom | Généré avec l'aide de ChatGPT (OpenAI)
 Date : 27.09.2025
-Résumé : Diagnostic complet Windows Server / Endpoint (user+admin compatible)
+Résumé : Pré-Diagnostic automatique complet Windows Server/Endpoint (user+admin compatible)
 #>
 
 cls
 
+
+
+
+
 # ====================================================================
 # INITIALISATION : TRANSCRIPT GLOBAL
 # ====================================================================
-try {
+try { #madebymoi with GhostEngineer
     if ($MyInvocation.MyCommand.Path) {
         $ScriptPath  = Split-Path -Parent $MyInvocation.MyCommand.Path
         $rapportPath = Join-Path $ScriptPath ("Diagnostic-Windows-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmm'))
@@ -70,7 +74,7 @@ Write-Host "Dernière MAJ  : $($LastUpdate.InstalledOn)"
 Write-Host "Dernier reboot: $LastReboot"
 
 # ====================================================================
-# BLOC 2B : INTEGRATION ANNUAIRE & OAUTH LOCAL
+# BLOC 2 : INTEGRATION ANNUAIRE & OAUTH LOCAL
 # ====================================================================
 Write-Host "`n=== Intégration annuaire / Azure AD / OAuth ===" -ForegroundColor Cyan
 try {
@@ -93,7 +97,7 @@ try {
         if ($prtActive)  { Write-Host "PRT (SSO) : Actif" -ForegroundColor Green }
         else             { Write-Host "PRT (SSO) : Inactif" -ForegroundColor Red }
     }
-    elseif ($workplaceJoin) {
+    elseif ($workplaceJoin) { # -=NG=
         Write-Host "État machine : Workplace Join (Azure AD Registered)" -ForegroundColor Yellow
         if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
     }
@@ -188,7 +192,7 @@ try {
                                 Write-Host ("{0} (ping FAIL)" -f $server) -ForegroundColor Red
                             }
                         }
-                        catch {
+                        catch { #madebygruber with chatGPT
                             Write-Host ("{0} (erreur de test)" -f $server) -ForegroundColor Yellow
                         }
                     }
@@ -211,7 +215,7 @@ try {
                 try {
                     $resolved = [System.Net.Dns]::GetHostAddresses($target) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
                     if ($resolved) { $remoteIP = $resolved.IPAddressToString }
-                } catch { }
+                } catch { } # -=NG=-.
             }
 
             $result = Test-Connection -ComputerName $remoteIP -Count 4 -ErrorAction SilentlyContinue
@@ -323,7 +327,7 @@ try {
     }
     else {
         Write-Host "Aucun admin local trouvé."
-    }
+    } #madebyngr with openai
 }
 catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
 
@@ -358,7 +362,7 @@ try {
     else {
         $raw = net use 2>$null
         $lines = $raw | Where-Object { $_ -match "^[A-Z]:" }
-        if ($lines) {
+        if ($lines) {# -=Nico-
             ($lines | ForEach-Object {
                 $parts = ($_ -split "\s+") -ne ""
                 [PSCustomObject]@{
@@ -421,7 +425,7 @@ catch {
 
 
 # ====================================================================
-# BLOC 8 : SANTE MATERIEL & RESSOURCES
+# BLOC 8a : SANTE MATERIEL & RESSOURCES
 # ====================================================================
 Write-Host "`n=== Santé Matériel & Ressources ===" -ForegroundColor Cyan
 
@@ -438,7 +442,7 @@ catch {
         if ($cpuAvg -ne $null) {
             Write-Host ("CPU Utilisation (approx.) : {0:N1} %" -f $cpuAvg)
         }
-        else {
+        else { #madebynico avec IA
             Write-Host "CPU Utilisation : Indisponible" -ForegroundColor Yellow
         }
     }
@@ -447,32 +451,72 @@ catch {
     }
 }
 
-# --- RAM ---
+# ====================================================================
+# BLOC 8b : SANTE MEMOIRE (RAM + SWAP)
+# ====================================================================
+Write-Host "`n=== Mémoire (RAM + Paging File) ===" -ForegroundColor Cyan
+
 try {
+    # --- RAM physique ---
     $ram = Get-CimInstance Win32_OperatingSystem
     $ramFreeGB  = [math]::Round($ram.FreePhysicalMemory/1MB,2)
     $ramTotalGB = [math]::Round($ram.TotalVisibleMemorySize/1MB,2)
     $ramUsedGB  = [math]::Round($ramTotalGB - $ramFreeGB,2)
-    Write-Host ("RAM Utilisation : {0} / {1} Go" -f $ramUsedGB, $ramTotalGB)
+    $ramPctFree = [math]::Round(($ramFreeGB / $ramTotalGB) * 100,1)
+
+    $color = if ($ramPctFree -ge 30) { "Green" } elseif ($ramPctFree -ge 15) { "Yellow" } else { "Red" }
+    Write-Host ("RAM Utilisation : {0} / {1} Go (Libre: {2} Go - {3}%)" -f $ramUsedGB, $ramTotalGB, $ramFreeGB, $ramPctFree) -ForegroundColor $color
 }
 catch {
-    Write-Host "RAM Utilisation : Indisponible" -ForegroundColor Yellow
+    Write-Host "RAM Utilisation : Non accessible" -ForegroundColor Yellow
 }
 
-# --- Disques ---
+try {
+    # --- Paging file (via CIM) ---
+    $pageFiles = Get-CimInstance Win32_PageFileUsage
+    if ($pageFiles) {
+        foreach ($pf in $pageFiles) {
+            $pct = [math]::Round(($pf.CurrentUsage / $pf.AllocatedBaseSize) * 100,1)
+            $color = if ($pct -lt 50) { "Green" } elseif ($pct -lt 80) { "Yellow" } else { "Red" }
+            Write-Host ("Fichier d’échange ({0}) : {1} Mo / {2} Mo ({3}%)" -f $pf.Name, $pf.CurrentUsage, $pf.AllocatedBaseSize, $pct) -ForegroundColor $color
+        }
+    }
+    else {
+        Write-Host "Fichier d’échange : Non configuré" -ForegroundColor Yellow
+    }
+}
+catch {
+    Write-Host "Fichier d’échange : Non accessible" -ForegroundColor Yellow
+}
+
+
+
+# ====================================================================
+# 8c Disques (avec indicateur)
+# ====================================================================
 try {
     Get-PSDrive -PSProvider FileSystem | ForEach-Object {
-        $total = $_.Used + $_.Free
-        if ($total -gt 0) {
-            $pctUsed = [math]::Round(($_.Used / $total) * 100,1)
-            $freeGB  = [math]::Round($_.Free/1GB,1)
-            Write-Host ("Disque {0} : {1} Go libres ({2}% utilisé)" -f $_.Name, $freeGB, $pctUsed)
+        $pctUsed  = [math]::Round(($_.Used / ($_.Used + $_.Free)) * 100,1)
+        $freeGB   = [math]::Round($_.Free / 1GB,1)
+        $totalGB  = [math]::Round(($_.Used + $_.Free) / 1GB,1)
+        $msg = ("Disque {0} : {1} / {2} Go libres ({3}% utilisé)" -f `
+                $_.Name, $freeGB, $totalGB, $pctUsed)
+
+        if ($pctUsed -lt 70) { # -=NG=-.
+            Write-Host $msg -ForegroundColor Green   # espace suffisant
+        }
+        elseif ($pctUsed -lt 90) {
+            Write-Host $msg -ForegroundColor Yellow  # à surveiller
+        }
+        else {
+            Write-Host $msg -ForegroundColor Red     # critique
         }
     }
 }
 catch {
-    Write-Host "Stockage : Indisponible" -ForegroundColor Yellow
+    Write-Host "Stockage : Non accessible" -ForegroundColor Yellow
 }
+
 
 
 
@@ -544,7 +588,7 @@ try {
         $_.StartType -eq "Automatic" -and $_.Status -ne "Running" -and
         ($CriticalServices -notcontains $_.Name)
     }
-    if ($OtherStopped) {
+    if ($OtherStopped) { #madebymoi with someonebetterthanme
         foreach ($svc in $OtherStopped) {
             $name  = Format-Text $svc.Name 15
             $dname = Format-Text $svc.DisplayName 40
@@ -561,7 +605,7 @@ catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yello
 
 
 # ====================================================================
-# BLOC 11 : WINDOWS UPDATE
+# BLOC 11a : WINDOWS UPDATE
 # ====================================================================
 Write-Host "`n=== Windows Update ===" -ForegroundColor Cyan
 try {
@@ -572,41 +616,39 @@ try {
 catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
 
 # ====================================================================
-# BLOC 11b : MICROSOFT OFFICE
+# BLOC 11b : APPLICATIONS MICROSOFT OFFICE
 # ====================================================================
-Write-Host "`n=== Microsoft Office ===" -ForegroundColor Cyan
+Write-Host "`n=== Applications Microsoft Office installées ===" -ForegroundColor Cyan
+
 try {
-    $officeRegPath1 = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
-    $officeRegPath2 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
-    $officeKey = $null
+    $officeApps = @()
 
-    if (Test-Path $officeRegPath1) { $officeKey = Get-ItemProperty $officeRegPath1 }
-    elseif (Test-Path $officeRegPath2) { $officeKey = Get-ItemProperty $officeRegPath2 }
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
 
-    if ($officeKey) {
-        $ver   = $officeKey.VersionToReport
-        $arch  = $officeKey.Platform
-        $prod  = $officeKey.ProductReleaseIds
+    foreach ($path in $uninstallPaths) {
+        $officeApps += Get-ItemProperty $path -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match "Office|Outlook|Word|Excel|PowerPoint|Access|Publisher|Teams" } |
+            Select-Object DisplayName, DisplayVersion, InstallDate
+    }
 
-        # Vérification si version >= Office 2016
-        if ($ver -match "^16\." ) {
-            Write-Host "Version détectée : $ver ($arch)" -ForegroundColor Green
-            if ($prod) { Write-Host "Édition : $prod" }
-        }
-        else {
-            Write-Host "Pas de version Office 2016 ou sup trouvée." -ForegroundColor Yellow
-        }
+    if ($officeApps) {
+        $officeApps | Sort-Object DisplayName | Format-Table -AutoSize
     }
     else {
-        Write-Host "Pas de version Office 2016 ou sup trouvée." -ForegroundColor Yellow
+        Write-Host "Aucune application Microsoft Office détectée." -ForegroundColor Yellow
     }
 }
 catch {
-    Write-Host "Impossible de déterminer la version d’Office." -ForegroundColor Yellow
+    Write-Host "Impossible de lire la liste des applications Office." -ForegroundColor Red
 }
 
+
 # ====================================================================
-# BLOC 11d : FICHIERS PST / OST (taille & emplacement)
+# BLOC 11c : FICHIERS PST / OST (taille & emplacement)
 # ====================================================================
 Write-Host "`n=== Fichiers Outlook PST / OST ===" -ForegroundColor Cyan
 
@@ -636,6 +678,85 @@ try {
 }
 catch {
     Write-Host "⚠️ Erreur lors du scan des fichiers PST/OST : $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# ====================================================================
+# BLOC 11d : DOSSIERS SYSTÈME UTILES (taille racine uniquement)
+# ====================================================================
+Write-Host "`n=== Dossiers système utiles ===" -ForegroundColor Cyan
+
+# Détection si Admin (pour SoftwareDistribution, WinSxS etc.)
+$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+
+$folders = @(
+    $env:TEMP,
+    "$env:SystemRoot\SoftwareDistribution\Download",
+    "$env:SystemRoot\Temp",
+    "$env:SystemRoot\Logs",
+    "$env:SystemRoot\WinSxS",
+    "$env:LOCALAPPDATA\Temp"
+)
+
+foreach ($folder in $folders) {
+    try {
+        if (-not (Test-Path $folder)) {
+            Write-Host ("{0,-60} | Non trouvé" -f $folder) -ForegroundColor Yellow
+            continue
+        }
+
+        # Garde-fou : certains dossiers nécessitent admin
+        if (($folder -like "$env:SystemRoot\*") -and -not $IsAdmin) {
+            Write-Host ("{0,-60} | Accès refusé (non admin)" -f $folder) -ForegroundColor Yellow
+            continue
+        }
+
+        $files = Get-ChildItem -Path $folder -File -ErrorAction SilentlyContinue
+        $count = $files.Count
+        $sizeMB = [math]::Round(($files | Measure-Object Length -Sum).Sum / 1MB, 1)
+        Write-Host ("{0,-60} | {1,5} fichiers | {2,8} Mo" -f $folder, $count, $sizeMB)
+    }
+    catch {
+        Write-Host ("{0,-60} | Erreur d'accès" -f $folder) -ForegroundColor Red
+    }
+}
+
+
+# ====================================================================
+# BLOC 11e : APPLICATIONS INSTALLÉES (HKLM + HKCU)
+# ====================================================================
+Write-Host "`n=== Applications installées (HKLM + HKCU) ===" -ForegroundColor Cyan
+
+try {
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    $apps = foreach ($path in $regPaths) {
+        if (Test-Path $path) {
+            Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object {
+                $_.DisplayName -and $_.DisplayName.Trim() -ne ""
+            } | Select-Object `
+                @{Name="Nom";Expression={$_.DisplayName}},
+                @{Name="Version";Expression={$_.DisplayVersion}},
+                @{Name="DateInstall";Expression={$_.InstallDate}},
+                @{Name="Source";Expression={$path.Split("\")[0]}}
+        }
+    }
+
+    if ($apps) {
+        # Impression compacte sans saut de ligne superflu
+        $apps | Sort-Object Nom | Format-Table -AutoSize | Out-String -Stream | ForEach-Object {
+            if ($_ -ne "") { Write-Host $_ }
+        }
+    }
+    else {
+        Write-Host "Aucune application trouvée dans HKLM/HKCU." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Host "Erreur lors de la récupération des applications." -ForegroundColor Red
 }
 
 
@@ -670,7 +791,7 @@ if (-not $IsAdmin) {
 }
 
 # ====================================================================
-# BLOC 13 : TEMPERATURE CPU
+# BLOC 13 : SANTE MATERIEL - TEMPERATURE CPU
 # ====================================================================
 Write-Host "`n=== Température CPU ===" -ForegroundColor Cyan
 try {
@@ -691,7 +812,7 @@ try {
 catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
 
 # ====================================================================
-# BLOC 14 : SMART DISQUES
+# BLOC 13a : SANTE MATERIEL - SMART DISQUES
 # ====================================================================
 Write-Host "`n=== État SMART des disques ===" -ForegroundColor Cyan
 try {
@@ -706,7 +827,7 @@ try {
 catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
 
 # ====================================================================
-# BLOC 15 : PERIPHERIQUES EN ERREUR (CRITIQUES UNIQUEMENT)
+# BLOC 14 : PERIPHERIQUES EN ERREUR (CRITIQUES UNIQUEMENT)
 # ====================================================================
 Write-Host "`n=== Périphériques en erreur (drivers) ===" -ForegroundColor Cyan
 try {
@@ -727,8 +848,8 @@ catch {
 # FIN DU DIAGNOSTIC
 # ====================================================================
 try {  Stop-Transcript | Out-Null}
-catch {   Write-Host "⚠️ Aucun transcript actif à arrêter." -ForegroundColor Yellow}
+catch { }
 
 if ($rapportPath -ne $null) {
-    Write-Host "`nRapport complet exporté vers : $rapportPath" -ForegroundColor Cyan}
-else {   Write-Host "Fin du diagnostic" -ForegroundColor Cyan}
+    Write-Host "`n`n`nRapport complet exporté vers : $rapportPath" -ForegroundColor Cyan}
+else {   Write-Host "`n`n`nFin du diagnostic" -ForegroundColor Cyan}
