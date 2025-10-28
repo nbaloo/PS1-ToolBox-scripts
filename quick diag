@@ -1,20 +1,20 @@
 <#
 Script PowerShell
 Utilisé par Nicolas GRUBER - Tebicom | Généré avec l'aide de ChatGPT (OpenAI)
-Date : 27.09.2025
+Date intitiale : 27.09.2025
 Résumé : Pré-Diagnostic automatique complet Windows Server/Endpoint (user+admin compatible)
+
+Version 0.91 - 28.10.2025
 #>
 
 cls
 
 # To DO - récup taille profil utilisateur de merde 
-# to DO - Group Policy was applied from:      ADDS01.ecoledesoins.lan
 # TO DO - drivers - afficher date du pilote
-# PRT - détecter les sous-comptes
 # Drvier printer - détecter les drivers postérieur à 2022
 
 # ====================================================================
-# INITIALISATION : TRANSCRIPT GLOBAL
+# QD - INITIALISATION : TRANSCRIPT GLOBAL
 # ====================================================================
 try { #madebymoi with GhostEngineer
     if ($MyInvocation.MyCommand.Path) {
@@ -33,9 +33,8 @@ catch {
 }
 
 
-
 # ====================================================================
-# INIT : Mesure CPU en arrière-plan
+# QD - INITIALISATION : Mesure CPU en arrière-plan
 # ====================================================================
 $SampleInterval = 1   # secondes entre mesures
 $SampleCount    = 10  # durée totale = 10s
@@ -47,20 +46,22 @@ $cpuJob = Start-Job -ScriptBlock {
     [math]::Round($avg,1)
 } -ArgumentList $SampleInterval,$SampleCount
 
-Write-Host "Start script" -ForegroundColor Darkgray
-
-
-cls
 
 # ====================================================================
-# BLOC 1 : INFOS SYSTEME
+# QD - BLOC 1 : INFOS SYSTEME
 # ====================================================================
-Write-Host "=== Diagnostic Complet Windows Server / Endpoint ===" -ForegroundColor Cyan
+Write-Host "=== Diagnostic rapide de Windows Server / Endpoint ===" -ForegroundColor Cyan
+
+
 $FQDN = [System.Net.Dns]::GetHostByName(($env:computerName)).HostName
 $OS   = Get-CimInstance Win32_OperatingSystem
 $CS   = Get-CimInstance Win32_ComputerSystem
 $BIOS = Get-CimInstance Win32_BIOS
 $LastReboot = $OS.LastBootUpTime
+$LastReboot  = $LastReboot.ToString("dd MMMM yyyy HH:mm:ss", [System.Globalization.CultureInfo]::GetCultureInfo("fr-FR"))
+# Format FR clair pour la mise en service
+$InstallDate    = $OS.InstallDate.ToString("dd MMMM yyyy HH:mm:ss", [System.Globalization.CultureInfo]::GetCultureInfo("fr-FR"))
+
 
 function Get-WindowsRelease {
     param([string]$BuildNumber)
@@ -103,22 +104,40 @@ if ($LastWU) {
     $LastUpdateStr = "Non trouvé"
 }
 
-# Format ISO pour reboot
-$LastRebootFmt  = $LastReboot.ToString("yyyy-MM-dd HH:mm:ss")
+# Détection de langue OS
+$osLang = (Get-Culture).TwoLetterISOLanguageName
+if ($osLang -in @('fr','en','de')) {
+    $LangColor = "Gray"
+    $LangMsg   = "Langue détectée : $osLang"
+} else {
+    $LangColor = "Yellow"
+    $LangMsg   = "Langue détectée : $osLang ⚠ NON supportée officiellement (FR/EN/DE uniquement)"
+}
 
 # Affichage aligné
-Write-Host ("{0,-22}: {1}" -f "Nom FQDN", $FQDN)
+Write-Host ("{0,-22}: {1}" -f "Nom FQDN", $FQDN)  -ForegroundColor White
 Write-Host ("{0,-22}: {1} {2}" -f "OS Version", $OS.Caption, $Release)
 Write-Host ("{0,-22}: {1}" -f "Dernière MAJ", $LastUpdateStr)
-Write-Host ("{0,-22}: {1}" -f "Dernier reboot", $LastRebootFmt)
+Write-Host ("{0,-22}: {1}" -f "Dernier reboot", $LastReboot)
+Write-Host ("{0,-22}: {1}" -f "Mise en service", $InstallDate)
 Write-Host ("{0,-22}: {1}" -f "Modèle", "$($CS.Manufacturer) $($CS.Model)")
 Write-Host ("{0,-22}: {1}" -f "N° de série", $BIOS.SerialNumber)
+Write-Host ("{0,-22}: {1}" -f "Langue système", $LangMsg) -ForegroundColor $LangColor
+# Vérifie si le Fast Startup est activé
+$fastBootValue = Get-ItemPropertyValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name HiberbootEnabled -ErrorAction SilentlyContinue
+$FastBootStatus = if ($fastBootValue -eq 1) { "Activé" } elseif ($fastBootValue -eq 0) { "Désactivé" } else { "Non supporté" }
+Write-Host ("{0,-22}: {1}" -f "FastBoot", $FastBootStatus) -ForegroundColor DarkGray
+
 
 # ====================================================================
-# BLOC 2 : INTEGRATION ANNUAIRE & OAUTH LOCAL
+# QD - BLOC 2 : INTEGRATION ANNUAIRE & OAUTH LOCAL
 # ====================================================================
 Write-Host "`n=== Intégration annuaire / Azure AD / OAuth ===" -ForegroundColor Cyan
+
 try {
+    # ----------------------------------------------------------------
+    # Extraction d'informations système
+    # ----------------------------------------------------------------
     $cs = Get-CimInstance Win32_ComputerSystem
     $dsreg = dsregcmd /status 2>$null
 
@@ -126,48 +145,167 @@ try {
     $workplaceJoin = ($dsreg -match "WorkplaceJoined\s*:\s*YES")
     $prtActive     = ($dsreg -match "AzureAdPrt\s*:\s*YES")
     $domainJoin    = $cs.PartOfDomain
-    
+
     try {
-    $currentUPN = (whoami /upn 2>$null)
-    if (-not $currentUPN) { $currentUPN = (whoami) }
-    }
-    catch {
-        $currentUPN = (whoami)
+        $executingAccount = (whoami /upn 2>$null)
+        if (-not $executingAccount) { $executingAccount = (whoami) }
+    } catch { $executingAccount = (whoami) }
+
+    # ----------------------------------------------------------------
+    # Détection du type d’intégration
+    # ----------------------------------------------------------------
+    $integrationType = "Workgroup / Non joint"
+    if ($aadJoin -and $domainJoin) { $integrationType = "HYBRID JOIN (AD + Azure AD)" }
+    elseif ($aadJoin)              { $integrationType = "Azure AD Join" }
+    elseif ($domainJoin)           { $integrationType = "Domain Join" }
+
+    Write-Host ""
+    Write-Host "Type d'intégration : $integrationType" -ForegroundColor White
+    Write-Host ""
+
+    if ($executingAccount) {
+        Write-Host "Identité utilisateur : $executingAccount" -ForegroundColor Cyan
     }
 
+    # ----------------------------------------------------------------
+    # Gestion de l'affichage PRT / OAuth selon le type d’intégration
+    # ----------------------------------------------------------------
+    if ($aadJoin -or $workplaceJoin) {
+        if ($prtActive) {
+            Write-Host "PRT (SSO) : Actif" -ForegroundColor Green
+        }
+        else {
+            Write-Host "PRT (SSO) : Inactif" -ForegroundColor Red
+        }
 
-    if ($domainJoin -and -not $aadJoin) {
-        Write-Host "État machine : Active Directory Join (domaine $($cs.Domain))" -ForegroundColor Green
-        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
-    }
-    elseif ($aadJoin) {
-        Write-Host "État machine : Azure AD Join" -ForegroundColor Green
-        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
-        if ($prtActive)  { Write-Host "PRT (SSO) : Actif" -ForegroundColor Green }
-        else             { Write-Host "PRT (SSO) : Inactif" -ForegroundColor Red }
-    }
-    elseif ($workplaceJoin) { # -=NG=
-        Write-Host "État machine : Workplace Join (Azure AD Registered)" -ForegroundColor Yellow
-        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
+        # Informations détaillées PRT (dates)
+        $prtInfo = $dsreg | Select-String -Pattern "PrtUpdateTime|PrtExpiryTime|AzureAdPrtUpdateTime|AzureAdPrtExpiryTime"
+        if ($prtInfo) {
+            Write-Host "`nDétails PRT :" -ForegroundColor Cyan
+            foreach ($line in $prtInfo) {
+                $name, $value = $line.ToString() -split ":", 2
+                $name  = $name.Trim()
+                $value = $value.Trim()
+                Write-Host ("{0,-25}: {1}" -f $name, $value) -ForegroundColor White
+            }
+        } else {
+            Write-Host "`nAucune information de date PRT trouvée dans dsregcmd /status" -ForegroundColor DarkGray
+        }
     }
     else {
-        Write-Host "État machine : Groupe de travail (Workgroup)" -ForegroundColor Red
-        if ($currentUPN) { Write-Host "Utilisateur courant : $currentUPN" }
+        Write-Host "Aucun compte AzureAD ou MSA détecté – pas de PRT applicable." -ForegroundColor DarkGray
     }
+
+    # ----------------------------------------------------------------
+    # Comptes AzureAD listés via dsregcmd
+    # ----------------------------------------------------------------
+    $rawList = dsregcmd /listaccounts 2>$null
+    $azureAccounts = @()
+    $defaultAccountId = $null
+
+    if ($rawList) {
+        $lines = $rawList -split "`r?`n"
+        foreach ($line in $lines) {
+            $t = $line.Trim()
+            if ($t -match '^Account:\s*(?<id>[^,]+),\s*user:\s*(?<user>[^,]+),\s*authority:\s*(?<auth>.+?)[\.\r\n]*$') {
+                $azureAccounts += [PSCustomObject]@{
+                    AccountId = $matches['id'].Trim()
+                    User      = $matches['user'].Trim()
+                    Authority = $matches['auth'].Trim().TrimEnd('.')
+                    IsDefault = $false
+                }
+            }
+            elseif ($t -match '^Default account:\s*(?<id>[^,]+),\s*user:\s*(?<user>.+)$') {
+                $defaultAccountId = $matches['id'].Trim()
+            }
+        }
+        if ($defaultAccountId) {
+            foreach ($a in $azureAccounts) {
+                if ($a.AccountId -eq $defaultAccountId) { $a.IsDefault = $true; break }
+            }
+        }
+    }
+
+    if ($azureAccounts.Count -gt 0) {
+        Write-Host "`nComptes AzureAD :" -ForegroundColor Cyan
+        $header = "{0,-8} {1,-28} {2,-36} {3,-36}" -f "Type","User","UID","TID"
+        Write-Host $header -ForegroundColor White
+        Write-Host ("-" * $header.Length) -ForegroundColor DarkGray
+
+        foreach ($a in $azureAccounts) {
+            $userGuid = "-"
+            $tenantGuid = "-"
+            if ($a.AccountId -match '^u:(?<uid>[^\.]+)\.(?<tid>.+)$') {
+                $userGuid = $matches['uid']
+                $tenantGuid = $matches['tid']
+            }
+            $tokenType = if ($a.IsDefault -and $prtActive) { "PRT" } else { "RT" }
+            $line = "{0,-8} {1,-28} {2,-36} {3,-36}" -f $tokenType,$a.User,$userGuid,$tenantGuid
+            Write-Host $line -ForegroundColor White
+        }
+    } else {
+        Write-Host "Aucun compte AzureAD détecté" -ForegroundColor DarkGray
+    }
+
+    # ----------------------------------------------------------------
+    # Comptes Microsoft (MSA) via cmdkey / StoredIdentities
+    # ----------------------------------------------------------------
+    $rawCmdKey = cmdkey /list 2>$null
+    $msaAccounts = @()
+    if ($rawCmdKey) {
+        $cklines = $rawCmdKey -split "`r?`n"
+        for ($i = 0; $i -lt $cklines.Count; $i++) {
+            $l = $cklines[$i].Trim()
+            if ($l -match 'Cible\s*:\s*MicrosoftAccount:.*user=(?<user>[\w\.\-\+@]+)') {
+                $msaAccounts += $matches['user'].Trim()
+            }
+            if ($l -match 'Cible\s*:\s*LegacyGeneric:target=MicrosoftAccount:user=(?<user>[\w\.\-\+@]+)') {
+                $msaAccounts += $matches['user'].Trim()
+            }
+        }
+        $msaAccounts = $msaAccounts | Select-Object -Unique
+    }
+
+    $storedIdentities = @()
+    try {
+        $keyPath = "HKCU:\Software\Microsoft\IdentityCRL\StoredIdentities"
+        if (Test-Path $keyPath) {
+            Get-ChildItem $keyPath | ForEach-Object {
+                $props = Get-ItemProperty -Path $_.PSPath
+                if ($props.PSObject.Properties.Name -contains 'DisplayableId') {
+                    $storedIdentities += $props.DisplayableId
+                } elseif ($props.PSObject.Properties.Name -contains 'UserName') {
+                    $storedIdentities += $props.UserName
+                }
+            }
+            $storedIdentities = $storedIdentities | Select-Object -Unique
+        }
+    } catch {}
+
+    if ($msaAccounts.Count -gt 0 -or $storedIdentities.Count -gt 0) {
+        Write-Host "`nComptes Microsoft (MSA) :" -ForegroundColor Cyan
+        foreach ($m in $msaAccounts) { Write-Host ("  {0}" -f $m) -ForegroundColor White }
+        foreach ($s in $storedIdentities) {
+            if (-not ($msaAccounts -contains $s)) { Write-Host ("  {0}" -f $s) -ForegroundColor White }
+        }
+    } else {
+        Write-Host "Aucun compte MSA détecté" -ForegroundColor DarkGray
+    }
+
+} catch {
+    Write-Host "⚠️ Erreur lors de la détection de l’intégration annuaire / OAuth : $($_.Exception.Message)" -ForegroundColor Yellow
 }
-catch {
-    Write-Host "Non accessible (dsregcmd bloqué ou droits insuffisants)" -ForegroundColor Yellow
-}
+
 
 
 # ====================================================================
-# BLOC 3 : RESEAU & CONNECTIVITE (corrigé avec Resolve-DnsName)
+# QD - BLOC 3 : RESEAU & CONNECTIVITE
 # ====================================================================
 Write-Host "`n=== Réseau & Connectivité ===" -ForegroundColor Cyan
 
 # Domaine utilisé pour tester la résolution DNS
 $DnsTestDomain = "www.microsoft.com"
-$DnsFallback   = "www.googe.ch"
+$DnsFallback   = "www.google.ch"
 
 Write-Host "(Résolution DNS testée sur $DnsTestDomain, fallback $DnsFallback)" -ForegroundColor DarkGray
 
@@ -362,7 +500,7 @@ try {
 catch { Write-Host "Impossible de lire le fichier hosts." -ForegroundColor Yellow }
 
 # ====================================================================
-# BLOC 4 : HEURE & NTP
+# QD - BLOC 4 : HEURE & NTP
 # ====================================================================
 Write-Host "`n=== Heure & NTP ===" -ForegroundColor Cyan
 $LocalTime = Get-Date
@@ -386,43 +524,85 @@ catch {
 
 
 # ====================================================================
-# BLOC 5 : ADMINS LOCAUX
+# QD - BLOC 5 : ADMINS LOCAUX
 # ====================================================================
 function Format-Text {
-    param($text, $max)
-    if ($null -eq $text) { return "" }
+    param(
+        [string]$text,
+        [int]$max
+    )
+    if ([string]::IsNullOrEmpty($text)) { return "" }
     if ($text.Length -gt $max) {
-        return $text.Substring(0, $max-3) + "..."
-    } else {
+        return $text.Substring(0, $max - 3) + "..."
+    }
+    else {
         return $text
     }
 }
 
 Write-Host "`n=== Administrateurs locaux ===" -ForegroundColor Cyan
 try {
-    $LocalAdmins = Get-LocalGroupMember -SID "S-1-5-32-544"
+    $LocalAdmins = Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop
+
     if ($LocalAdmins) {
+        # Vérifie la disponibilité du module ActiveDirectory
+        $ADAvailable = Get-Module -ListAvailable -Name ActiveDirectory | ForEach-Object { $true }
+
         foreach ($adm in $LocalAdmins) {
-            $name = Format-Text $adm.Name 40
-            $cls  = Format-Text $adm.ObjectClass 15
-            Write-Host ("{0,-40} | {1}" -f $name, $cls)
+            $name = $adm.Name
+            $cls  = $adm.ObjectClass
+
+            # Comptes inconnus (SID non résolu)
+            if ($adm.Name -match "^S-1-5-") {
+                $name = "[Inconnu] $($adm.Name)"
+                $cls  = "SID non résolu"
+            }
+
+            # Détection des comptes désactivés (si AD et module dispo)
+            if ($ADAvailable -and $adm.ObjectClass -eq 'User' -and $adm.PrincipalSource -eq 'ActiveDirectory') {
+                try {
+                    $user = Get-ADUser -Identity $adm.Name -Properties Enabled -ErrorAction Stop
+                    if (-not $user.Enabled) {
+                        $name += " [désactivé]"
+                    }
+                }
+                catch {
+                    # Ignorer les erreurs (compte non résolu ou pas dans AD)
+                }
+            }
+
+            $nameFmt = Format-Text $name 45
+            $clsFmt  = Format-Text $cls 20
+            Write-Host ("{0,-45} | {1}" -f $nameFmt, $clsFmt)
         }
     }
     else {
-        Write-Host "Aucun admin local trouvé."
-    } #madebyngr with openai
+        Write-Host "Aucun administrateur local trouvé." -ForegroundColor Green
+    }
 }
-catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
-
+catch {
+    Write-Host "Non accessible (droits administrateur requis)" -ForegroundColor Yellow
+}
 
 # ====================================================================
-# BLOC 6a : PARTAGES LOCAUX
+# QD - BLOC 6 : PARTAGES LOCAUX
 # ====================================================================
+
 Write-Host "`n=== Partages locaux définis sur cette machine ===" -ForegroundColor Cyan
+
 try {
     $shares = Get-SmbShare | Where-Object { $_.Name -notin @("IPC$") }
+
     if ($shares) {
-        ($shares | Select-Object Name, Path, Description, ShareType | Format-Table -AutoSize | Out-String).Trim() | Write-Host
+        foreach ($s in $shares) {
+            $exists = Test-Path $s.Path
+            if (-not $exists) {
+                Write-Host ("{0,-20} {1}" -f $s.Name, $s.Path) -ForegroundColor Yellow
+            }
+            else {
+                Write-Host ("{0,-20} {1}" -f $s.Name, $s.Path)
+            }
+        }
     }
     else {
         Write-Host "Aucun partage local trouvé." -ForegroundColor Green
@@ -430,85 +610,232 @@ try {
 }
 catch {
     Write-Host "Impossible de récupérer les partages locaux (droits requis ?)" -ForegroundColor Yellow
+    if ($DebugMode) { Write-Host $_.Exception.Message -ForegroundColor DarkGray }
 }
 
 # ====================================================================
-# BLOC 6b : LECTEURS RÉSEAU CONNECTÉS
+# QD - BLOC 6b : LECTEURS RÉSEAU CONNECTÉS
 # ====================================================================
+
 Write-Host "`n=== Lecteurs réseau montés (net use) ===" -ForegroundColor Cyan
+
 try {
     $mappings = Get-SmbMapping -ErrorAction SilentlyContinue
 
     if ($mappings) {
-        ($mappings | Select-Object LocalPath, RemotePath, Status | Format-Table -AutoSize | Out-String).Trim() | Write-Host
+        foreach ($m in $mappings) {
+            Write-Host ("{0,-10} {1,-45} {2}" -f $m.LocalPath, $m.RemotePath, $m.Status)
+        }
     }
     else {
         $raw = net use 2>$null
         $lines = $raw | Where-Object { $_ -match "^[A-Z]:" }
-        if ($lines) {# -=Nico-
-            ($lines | ForEach-Object {
-                $parts = ($_ -split "\s+") -ne ""
-                [PSCustomObject]@{
-                    Lecteur = $parts[0]
-                    Cible   = $parts[1]
-                    Etat    = $parts[-1]
+
+        if ($lines) {
+            $lines | ForEach-Object {
+                if ($_ -match "^(?<Lecteur>[A-Z]:)\s+(?<Cible>\\\\[^\s]+)\s+.*(?<Etat>OK|Déconnecté|Disconnected)$") {
+                    Write-Host ("{0,-10} {1,-45} {2}" -f $matches['Lecteur'], $matches['Cible'], $matches['Etat'])
                 }
-            } | Format-Table -AutoSize | Out-String).Trim() | Write-Host
+            }
         }
         else {
-            Write-Host "Aucun lecteur réseau actuellement connecté." -ForegroundColor Green
+            Write-Host "Aucun lecteur réseau actuellement connecté." -ForegroundColor white
         }
     }
 }
 catch {
     Write-Host "Impossible de récupérer les lecteurs réseau." -ForegroundColor Yellow
+    if ($DebugMode) { Write-Host $_.Exception.Message -ForegroundColor DarkGray }
 }
 
 
+
 # ====================================================================
-# BLOC 7 : SESSIONS UTILISATEURS (locale / RDP)
+# QD - BLOC 7 : SESSIONS UTILISATEURS (locale / RDP)
 # ====================================================================
 Write-Host "`n=== Sessions Utilisateurs (locale / RDP) ===" -ForegroundColor Cyan
-try { # je cache 
-    $sessions = (qwinsta) -split "`r?`n" | Where-Object {$_ -match "console|rdp"}
-    $logons = Get-CimInstance Win32_LoggedOnUser | ForEach-Object {
-        $u = $_.Antecedent.ToString()
-        if ($u -match 'Domain="(.+)",Name="(.+)"') {
-            [PSCustomObject]@{
-                Domain = $matches[1]
-                User   = $matches[2]
+
+# --- Mode debug manuel (forçable)
+$DebugMode = $false
+
+try {
+    # --- Détection si rôle RDS actif (multi-session)
+    $isRDS = $false
+    try {
+        $tsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+        if (Test-Path $tsKey) {
+            $isRDS = ((Get-ItemProperty -Path $tsKey).TSEnabled -eq 1)
+        }
+    } catch {}
+
+    # --- Lecture fiable de qwinsta (ISE/console)
+    $raw = cmd /c qwinsta 2>$null
+    if (-not $raw) { throw "qwinsta n'a rien retourné" }
+
+    # --- Parsing des sessions
+    $sessions = $raw -split "`r?`n" |
+        Where-Object { $_ -and ($_ -notmatch 'SESSIONNAME\s+USERNAME') } |
+        ForEach-Object {
+            $line = $_.TrimStart() -replace '^\>', ''
+            if ($line -match '^\s*(\S+)\s+(\S*)\s+(\d+)\s+(\S+)') {
+                [PSCustomObject]@{
+                    SessionName = $matches[1]
+                    User        = if ($matches[2]) { $matches[2] } else { '' }
+                    ID          = [int]$matches[3]
+                    State       = $matches[4]
+                }
             }
+        }
+
+    # --- Sessions système attendues
+    $expectedSystemSessions = @('services','console','rdp-tcp')
+
+    # --- Détection des profils utilisateurs
+    $profiles = Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { $_.LocalPath } | ForEach-Object {
+        $uname = $null
+        try {
+            $uname = (New-Object System.Security.Principal.SecurityIdentifier($_.SID)).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+        } catch {}
+        [PSCustomObject]@{
+            UserName  = $uname
+            LocalPath = $_.LocalPath
+            IsTemp    = $_.Temporary
         }
     }
 
-    if ($sessions) {
-        foreach ($s in $sessions) {
-            $parts = ($s -split '\s+') -ne ''
-            $sessionName = $parts[0]
-            $userNT      = $parts[1]
-            $id          = $parts[2]
-            $state       = $parts[3]
+    # --- Détection FSLogix avancée
+    $fslogixInstalled = $false
+    $fslogixVhdPaths = @()
+    try {
+        $regKey = 'HKLM:\SOFTWARE\FSLogix\Profiles'
+        if (Test-Path $regKey) {
+            $fslogixInstalled = $true
+            $locations = (Get-ItemProperty -Path $regKey -ErrorAction Stop).VHDLocations
+            if ($locations) {
+                $locations -split ';' | ForEach-Object {
+                    if (Test-Path $_) {
+                        $fslogixVhdPaths += Get-ChildItem -Path $_ -Filter '*.vhdx' -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    } catch { }
 
-            $resolved = $logons | Where-Object { $_.User -eq $userNT } | Select-Object -First 1
-            if ($resolved) {
-                $userDisplay = "$($resolved.User) ($($resolved.Domain))"
-            } else {
-                $userDisplay = $userNT
+    # --- Filtrer les sessions utilisateur (pas les systèmes)
+    $userSessions = $sessions | Where-Object {
+        $_.SessionName -notin @('services','rdp-tcp') -and $_.User -ne ''
+    }
+
+    # --- Affichage principal
+    if ($userSessions) {
+        "{0,-15} {1,-30} {2,-5} {3,-12} {4}" -f "Session", "Utilisateur", "ID", "État", "Profil"
+        Write-Host ("-" * 90)
+
+        foreach ($s in $userSessions) {
+            # Couleur par état
+            if ($s.State -match '^(?i)acti|conn') { $color = 'Green' }
+            elseif ($s.State -match '^(?i)disco') { $color = 'Yellow' }
+            else { $color = 'Gray' }
+
+            # Type de profil
+            $profile = $profiles | Where-Object { $_.UserName -ieq $s.User } | Select-Object -First 1
+            $profileType = 'Inconnu'
+
+            if ($profile) {
+                if ($profile.IsTemp) {
+                    $profileType = 'Temporaire'
+                    $color = 'Red'
+                    if ($fslogixInstalled) {
+                        Write-Host ("   Alerte : FSLogix installé mais profil temporaire détecté pour $($s.User)") -ForegroundColor Red
+                    }
+                }
+                elseif ($profile.LocalPath -match '^\\\\') {
+                    $profileType = 'Redirigé'
+                }
+                elseif ($profile.LocalPath -match '(FSLogix|\.vhdx)') {
+                    $profileType = 'FSLogix'
+                }
+                elseif ($fslogixVhdPaths | Where-Object { $_.Name -match [regex]::Escape($s.User) }) {
+                    $profileType = 'FSLogix'
+                }
+                else {
+                    $profileType = 'Local'
+                }
             }
 
-            Write-Host ("{0,-20} {1,-35} {2,-3} {3}" -f $sessionName, $userDisplay, $id, $state)
+            Write-Host ("{0,-15} {1,-30} {2,-5} {3,-12} {4}" -f $s.SessionName, $s.User, $s.ID, $s.State, $profileType) -ForegroundColor $color
         }
     } else {
-        Write-Host "Aucune session détectée."
+        Write-Host "Aucune session utilisateur active." -ForegroundColor DarkGray
     }
+
+    # --- Vérification sessions système manquantes (seulement si RDS)
+    $missing = @()
+    if ($isRDS) {
+        $foundSystemSessions = $sessions.SessionName | Where-Object { $_ -in $expectedSystemSessions }
+        $missing = $expectedSystemSessions | Where-Object { $_ -notin $foundSystemSessions }
+
+        if ($missing) {
+            Write-Host "`nSessions système manquantes :" -ForegroundColor Red
+            foreach ($m in $missing) {
+                Write-Host "   $m (session système éteinte !)" -ForegroundColor Red
+            }
+            $DebugMode = $true
+        }
+    }
+
+    # --- Vérification des sessions "fantômes"
+    if ($isRDS) {
+        $explorerSessions = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SessionId -Unique
+        $ghostSessions = $sessions | Where-Object { $_.ID -notin $explorerSessions -and $_.User -ne '' }
+        if ($ghostSessions) {
+            Write-Host "`nSessions fantômes détectées (pas d'explorer.exe actif) :" -ForegroundColor Red
+            foreach ($g in $ghostSessions) {
+                Write-Host ("   {0} ({1}) - {2}" -f $g.User, $g.SessionName, $g.State) -ForegroundColor Red
+            }
+        }
+    }
+
+    # --- Vérification des profils FSLogix verrouillés
+    if ($fslogixInstalled -and $fslogixVhdPaths) {
+        $lockFiles = @()
+        foreach ($path in ($fslogixVhdPaths | Select-Object -ExpandProperty DirectoryName -Unique)) {
+            $lockFiles += Get-ChildItem -Path $path -Filter '*.lock' -ErrorAction SilentlyContinue
+        }
+
+        if ($lockFiles) {
+            $activeUsers = $userSessions.User
+            $lockedOrphans = $lockFiles | Where-Object {
+                $name = $_.BaseName -replace '\.vhdx$', ''
+                $activeUsers -notcontains $name
+            }
+
+            if ($lockedOrphans) {
+                Write-Host "`nProfils FSLogix verrouillés sans session active :" -ForegroundColor Red
+                foreach ($lock in $lockedOrphans) {
+                    Write-Host ("   {0}" -f $lock.FullName) -ForegroundColor Red
+                }
+            }
+        }
+    }
+
+    # --- Mode Debug étendu : affiche aussi les sessions système
+    if ($DebugMode -and $sessions) {
+        Write-Host "`n=== Sessions Système (debug) ===" -ForegroundColor DarkCyan
+        foreach ($sys in $sessions | Where-Object { $_.SessionName -in $expectedSystemSessions }) {
+            $sysUser = if ($sys.User) { $sys.User } else { '<n/a>' }
+            Write-Host ("{0,-15} {1,-30} {2,-5} {3,-12}" -f $sys.SessionName, $sysUser, $sys.ID, $sys.State) -ForegroundColor DarkGray
+        }
+    }
+
 }
 catch {
-    Write-Host "Impossible de récupérer les sessions." -ForegroundColor Yellow
+    Write-Host "Impossible de récupérer les sessions : $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 
 # ====================================================================
-# BLOC 8a : SANTE MATERIEL & RESSOURCES
+# QD - BLOC 8a : SANTE MATERIEL & RESSOURCES
 # ====================================================================
 Write-Host "`n=== Santé Matériel & Ressources ===" -ForegroundColor Cyan
 
@@ -535,7 +862,7 @@ catch {
 }
 
 # ====================================================================
-# BLOC 8b : SANTE MEMOIRE (RAM + SWAP)
+# QD - BLOC 8b : SANTE MEMOIRE (RAM + SWAP)
 # ====================================================================
 Write-Host "`n=== Mémoire (RAM + Paging File) ===" -ForegroundColor Cyan
 
@@ -598,7 +925,7 @@ catch {
 }
 
 # ====================================================================
-# BLOC 9 : SECURITE
+# QD - BLOC 9 : SECURITE
 # ====================================================================
 Write-Host "`n=== Sécurité ===" -ForegroundColor Cyan
 Write-Host "ne détecte que le statut de Windows Defender" -ForegroundColor Gray
@@ -622,7 +949,7 @@ catch { Write-Host "BitLocker : Non accessible (droits admin requis)" -Foregroun
 
 
 # ====================================================================
-# BLOC 10 : SERVICES (CRITIQUES + AUTRES)
+# QD - BLOC 10 : SERVICES (CRITIQUES + AUTRES)
 # ====================================================================
 
 function Format-Text {
@@ -683,7 +1010,7 @@ catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yello
 
 
 # ====================================================================
-# BLOC 11a : WINDOWS UPDATE
+# QD - BLOC 11a : WINDOWS UPDATE
 # ====================================================================
 Write-Host "`n=== Windows Update ===" -ForegroundColor Cyan
 try {
@@ -695,7 +1022,7 @@ catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yello
 
 
 # ====================================================================
-# BLOC 11c : FICHIERS PST / OST (taille & emplacement)
+# QD - BLOC 11c : FICHIERS PST / OST (taille & emplacement)
 # ====================================================================
 Write-Host "`n=== Fichiers Outlook PST / OST ===" -ForegroundColor Cyan
 
@@ -716,19 +1043,36 @@ try {
     }
 
     if ($files.Count -gt 0) {
-        $files | Select-Object FullName,@{Name="Taille (Go)";Expression={[math]::Round($_.Length / 1GB,2)}} | 
-            Format-Table -AutoSize
+
+        foreach ($f in $files) {
+            $tailleGo = [math]::Round($f.Length / 1e9, 2)
+
+            if ($tailleGo -ge 45) {
+                $color = 'Red'
+                $niveau = '⚠️ Critique'
+            }
+            elseif ($tailleGo -ge 35) {
+                $color = 'Yellow'
+                $niveau = 'Attention'
+            }
+            else {
+                $color = 'Green'
+                $niveau = 'OK'
+            }
+
+            Write-Host ("{0,-80} {1,8} Go   {2}" -f $f.FullName, $tailleGo, $niveau) -ForegroundColor $color
+        }
     }
     else {
         Write-Host "Aucun fichier PST/OST trouvé dans le profil courant." -ForegroundColor Yellow
     }
-} #ng
+}
 catch {
     Write-Host "⚠️ Erreur lors du scan des fichiers PST/OST : $($_.Exception.Message)" -ForegroundColor Red
 }
 
 # ====================================================================
-# BLOC 11d : DOSSIERS SYSTÈME UTILES (taille racine uniquement)
+# QD - BLOC 11d : DOSSIERS SYSTÈME UTILES (taille racine uniquement)
 # ====================================================================
 Write-Host "`n=== Dossiers système utiles ===" -ForegroundColor Cyan
 
@@ -769,46 +1113,48 @@ foreach ($folder in $folders) {
 
 
 # ====================================================================
-# BLOC 11e : APPLICATIONS INSTALLÉES (HKLM + HKCU)
+# QD - BLOC 11e : APPLICATIONS INSTALLÉES (enrichies)
 # ====================================================================
-Write-Host "`n=== Applications installées (HKLM + HKCU) ===" -ForegroundColor Cyan
+Write-Host "`n=== Inventaire des applications (HKLM + HKCU) ===" -ForegroundColor Cyan
 
-try {
-    $regPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
+$regPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
 
-    $apps = foreach ($path in $regPaths) {
-        if (Test-Path $path) {
-            Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object {
-                $_.DisplayName -and $_.DisplayName.Trim() -ne ""
-            } | Select-Object `
-                @{Name="Nom";Expression={$_.DisplayName}},
-                @{Name="Version";Expression={$_.DisplayVersion}},
-                @{Name="DateInstall";Expression={$_.InstallDate}},
-                @{Name="Source";Expression={$path.Split("\")[0]}}
-        }
-    }
-
-    if ($apps) {
-        # Impression compacte sans saut de ligne superflu
-        $apps | Sort-Object Nom | Format-Table -AutoSize | Out-String -Stream | ForEach-Object {
-            if ($_ -ne "") { Write-Host $_ }#madebygruber with openai
-        }
-    }
-    else {
-        Write-Host "Aucune application trouvée dans HKLM/HKCU." -ForegroundColor Green
+$apps = foreach ($path in $regPaths) {
+    if (Test-Path $path) {
+        Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object {
+            $_.DisplayName -and $_.DisplayName.Trim() -ne ""
+        } | Select-Object `
+            @{Name="Nom";Expression={$_.DisplayName}},
+            @{Name="Version";Expression={$_.DisplayVersion}},
+            @{Name="Editeur";Expression={$_.Publisher}},
+            @{Name="Type";Expression={
+                if ($_.DisplayName -match "Runtime|Redistributable|Host|WebView2") {"Runtime"}
+                elseif ($_.DisplayName -match "Microsoft (Edge|Office|OneDrive|Teams)") {"System"}
+                else {"UserApp"}
+            }},
+            @{Name="DateInstall";Expression={$_.InstallDate}},
+            @{Name="Taille(MB)";Expression={if ($_.EstimatedSize) {[math]::Round($_.EstimatedSize/1024,1)}}},
+            @{Name="Chemin";Expression={$_.InstallLocation}},
+            @{Name="Source";Expression={$path.Split("\")[0]}}
     }
 }
-catch {
-    Write-Host "Erreur lors de la récupération des applications." -ForegroundColor Red
+
+if ($apps) {
+    $apps = $apps | Sort-Object Nom, Version -Unique
+    Write-Host "Total : $($apps.Count) applications détectées.`n" -ForegroundColor Green
+    $apps | Format-Table -AutoSize
+}
+else {
+    Write-Host "Aucune application trouvée." -ForegroundColor Yellow
 }
 
 
 # ====================================================================
-# BLOC 12 : EVENT VIEWER (24 dernières heures) - Compact & Aligné
+# QD - BLOC 12 : EVENT VIEWER (24 dernières heures) - Compact & Aligné
 # ====================================================================
 Write-Host "`n=== Analyse Event Viewer (24 dernières heures) ===" -ForegroundColor Cyan
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
@@ -849,7 +1195,7 @@ if (-not $IsAdmin) {
 
 
 # ====================================================================
-# BLOC 13 : SANTE MATERIEL - TEMPERATURE CPU
+# QD - BLOC 13 : SANTE MATERIEL - TEMPERATURE CPU
 # ====================================================================
 Write-Host "`n=== Température CPU ===" -ForegroundColor Cyan
 try {
@@ -870,22 +1216,7 @@ try {
 catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
 
 # ====================================================================
-# BLOC 13a : SANTE MATERIEL - SMART DISQUES
-# ====================================================================
-Write-Host "`n=== État SMART des disques ===" -ForegroundColor Cyan
-try {
-    $disks = Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction Stop
-    if ($disks -and $disks.Count -gt 0) {
-        foreach ($d in $disks) {
-            Write-Host ("{0,-20} | État: {1,-10} | Secteurs réalloués: {2}" -f `
-                $d.FriendlyName, $d.HealthStatus, $d.ReallocatedSectorsCount)
-        }
-    } else { Write-Host "Aucun disque compatible SMART détecté." }
-}
-catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
-
-# ====================================================================
-# BLOC 14 : PERIPHERIQUES EN ERREUR (CRITIQUES UNIQUEMENT)
+# QD - BLOC 14 : PERIPHERIQUES EN ERREUR (CRITIQUES UNIQUEMENT)
 # ====================================================================
 Write-Host "`n=== Périphériques en erreur (drivers) ===" -ForegroundColor Cyan
 try {
@@ -903,35 +1234,35 @@ catch {
 }
 
 # ====================================================================
-# BLOC 15 : POLITIQUES (AD GPO ou MDM Intune)
+# QD - BLOC 15 : POLITIQUES (AD GPO ou MDM Intune)
 # ====================================================================
 Write-Host "`n=== Politiques appliquées ===" -ForegroundColor Cyan
 
-# Vérifie si machine est Azure AD Join
-$dsreg = dsregcmd /status
+# Vérifie état de jonction
+$dsreg = dsregcmd /status | Out-String
+$aadJoined    = $dsreg -match "AzureAdJoined\s*:\s*(YES|OUI|JA)"
+$domainJoined = $dsreg -match "DomainJoined\s*:\s*(YES|OUI|JA)"
 
-if ($dsreg -match "AzureAdJoined\s*:\s*YES") {
+if ($aadJoined) {
     Write-Host "Cet appareil est Azure AD Join : pas de GPO classiques." -ForegroundColor Yellow
     Write-Host "Les politiques proviennent d'Intune / MDM." -ForegroundColor DarkGray
 
     try {
         $mdmPolicies = Get-WinEvent -LogName Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin |
-                       Where-Object { $_.Message -like "*PolicyManager MDM*" } |
+                       Where-Object { $_.Message -like "*PolicyManager*" } |
                        Select-Object TimeCreated, Message |
                        Sort-Object TimeCreated -Descending |
-                       Select-Object -First 10
+                       Select-Object -First 15
 
         if ($mdmPolicies) {
-            Write-Host "Dernières politiques MDM reçues (résumé)" -ForegroundColor Cyan
+            Write-Host "15 Dernières politiques MDM reçues (résumé)" -ForegroundColor Cyan
             foreach ($p in $mdmPolicies) {
-                # Extraction simple de la Zone et de la Stratégie avec RegEx
-                if ($p.Message -match "Stratégie : \((?<Strategy>.+?)\).*Zone : \((?<Zone>.+?)\)") {
+                if ($p.Message -match "(Stratégie|Policy)\s*:\s*\((?<Strategy>.+?)\).*?(Zone|Area)\s*:\s*\((?<Zone>.+?)\)") {
                     $strategy = $matches['Strategy']
                     $zone     = $matches['Zone']
                     Write-Host ("[{0}] {1,-10} : {2}" -f $p.TimeCreated, $zone, $strategy) -ForegroundColor DarkGray
                 }
                 else {
-                    # fallback si parsing échoue
                     Write-Host ("[{0}] {1}" -f $p.TimeCreated, $p.Message) -ForegroundColor DarkGray
                 }
             }
@@ -943,40 +1274,129 @@ if ($dsreg -match "AzureAdJoined\s*:\s*YES") {
         Write-Host "Impossible de lire les politiques MDM." -ForegroundColor Red
     }
 }
-else {
-    Write-Host "Cet appareil est AD Join : affichage des GPO." -ForegroundColor Yellow
+elseif ($domainJoined) {
     try {
-        [xml]$xml = Get-GPResultantSetOfPolicy -ReportType Xml -Path "$env:TEMP\gpo.xml"
-        
-        Write-Host "`n--- Côté Ordinateur ---" -ForegroundColor Cyan
-        if ($xml.Rsop.ComputerResults.GPO) {
-            $xml.Rsop.ComputerResults.GPO | ForEach-Object {
-                Write-Host (" - {0}" -f $_.Name) -ForegroundColor DarkGray
-            }
-        } else {
-            Write-Host "Aucune GPO appliquée côté ordinateur." -ForegroundColor Yellow
-        }
+        $domain = (Get-WmiObject Win32_ComputerSystem).Domain
 
-        Write-Host "`n--- Côté Utilisateur ($env:USERNAME) ---" -ForegroundColor Cyan
-        if ($xml.Rsop.UserResults.GPO) {
-            $xml.Rsop.UserResults.GPO | ForEach-Object {
-                Write-Host (" - {0}" -f $_.Name) -ForegroundColor DarkGray
-            }
-        } else {
-            Write-Host "Aucune GPO appliquée côté utilisateur." -ForegroundColor Yellow
-        }
+        # Récupère le DC ayant répondu via nltest
+        $dcInfo = nltest /dsgetdc:$domain 2>&1
+        $dcResponding = ($dcInfo | Select-String "DC:").ToString().Split(":")[1].Trim()
+
+        Write-Host "Cet appareil est Domain Join (AD)." -ForegroundColor Yellow
+        Write-Host "Contrôleur ayant répondu : $dcResponding" -ForegroundColor Yellow
+        Write-Host "Les politiques proviennent des GPO de l’Active Directory." -ForegroundColor DarkGray
     }
     catch {
-        Write-Host "Impossible de récupérer la liste des GPO (droits admin requis ?)." -ForegroundColor Red
+        Write-Host "Cet appareil est Domain Join (AD), mais impossible de déterminer le contrôleur." -ForegroundColor Yellow
+    }
+
+    function Get-GPOFromGpresult {
+        param([string]$Scope)
+
+        try {
+            $raw = gpresult /r /scope $Scope 2>&1 | Out-String
+
+            if ($raw -match "Access Denied" -or $raw -match "Accès refusé" -or $raw -match "Zugriff verweigert") {
+                return "ACCESS_DENIED"
+            }
+
+            # Motifs multilingues pour détecter début de la section
+            $patternsStart = @(
+                "Applied Group Policy Objects",
+                "Objets de stratégie de groupe appliqués",
+                "Angewendete Gruppenrichtlinienobjekte"
+            )
+
+            # Motifs multilingues pour détecter fin de section
+            $patternsEnd = @(
+                "The computer is a part of",      # EN
+                "The user is a part of",
+                "L'ordinateur fait partie",       # FR
+                "L'utilisateur fait partie",
+                "Der Computer ist Mitglied",      # DE
+                "Der Benutzer ist Mitglied"
+            )
+
+            $lines = $raw -split "`r?`n"
+            $capture = $false
+            $gpos = @()
+
+            foreach ($line in $lines) {
+                if (-not $capture -and ($patternsStart | Where-Object { $line -match $_ })) {
+                    $capture = $true
+                    continue
+                }
+
+                if ($capture -and ($patternsEnd | Where-Object { $line -match $_ })) {
+                    break
+                }
+
+                if ($capture) {
+                    $trimmed = $line.Trim()
+                    # On ignore les séparateurs et les lignes "Filtering:"
+                    if ($trimmed -and ($trimmed -notmatch "^-+$") -and ($trimmed -notmatch "Filtering")) {
+                        $gpos += $trimmed
+                    }
+                }
+            }
+            return $gpos
+        }
+        catch {
+            return "ERROR"
+        }
+    }
+
+    # --- Côté ordinateur ---
+    Write-Host "`n--- Côté Ordinateur ---" -ForegroundColor Cyan
+    $compGPOs = Get-GPOFromGpresult -Scope computer
+    if ($compGPOs -eq "ACCESS_DENIED") {
+        Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow
+    } elseif ($compGPOs -eq "ERROR") {
+        Write-Host "Impossible de récupérer la liste des GPO." -ForegroundColor Red
+    } elseif ($compGPOs.Count -gt 0) {
+        foreach ($gpo in $compGPOs) {
+            Write-Host (" - {0}" -f $gpo) -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "Aucune GPO détectée côté ordinateur." -ForegroundColor Yellow
+    }
+
+    # --- Côté utilisateur ---
+    Write-Host "`n--- Côté Utilisateur ($env:USERNAME) ---" -ForegroundColor Cyan
+    $userGPOs = Get-GPOFromGpresult -Scope user
+    if ($userGPOs -eq "ACCESS_DENIED") {
+        Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow
+    } elseif ($userGPOs -eq "ERROR") {
+        Write-Host "Impossible de récupérer la liste des GPO." -ForegroundColor Red
+    } elseif ($userGPOs.Count -gt 0) {
+        foreach ($gpo in $userGPOs) {
+            Write-Host (" - {0}" -f $gpo) -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "Aucune GPO détectée côté utilisateur." -ForegroundColor Yellow
+    }
+}
+else {
+    try {
+        $workgroup = (Get-WmiObject Win32_ComputerSystem).Domain
+        Write-Host "Cet appareil n’est ni Domain Join ni Azure AD Join (Workgroup : $workgroup)." -ForegroundColor Yellow
+        Write-Host "Seules les stratégies locales (gpedit.msc) s’appliquent." -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "Cet appareil est en Workgroup, mais impossible de déterminer le nom du groupe de travail." -ForegroundColor Yellow
     }
 }
 
-# ====================================================================
-# FIN DU DIAGNOSTIC
-# ====================================================================
+
+# ==================================================================================================================================================================================================================================================
+# QD - FIN DU DIAGNOSTIC
+# ==================================================================================================================================================================================================================================================
 try {  Stop-Transcript | Out-Null}
 catch { }
 
 if ($rapportPath -ne $null) {
     Write-Host "`n`n`nRapport complet exporté vers : $rapportPath" -ForegroundColor Cyan}
 else {   Write-Host "`n`n`nFin du diagnostic" -ForegroundColor Cyan}
+
+
+
