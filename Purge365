@@ -1,0 +1,84 @@
+# ====================================================================
+# QD - Purge complète du cache d'identité FSLogix (RDS safe - auto-dépannage)
+# ====================================================================
+
+Add-Type -AssemblyName System.Windows.Forms
+
+# --- Avertissement utilisateur ---
+$dialogResult = [System.Windows.Forms.MessageBox]::Show(
+    "ATTENTION : Tous les programmes Office (Outlook, Teams, OneDrive, Word, Excel, etc.) vont être FERMÉS.
+Assurez-vous d'avoir SAUVEGARDÉ votre travail avant de continuer.",
+    "Avertissement - Purge FSLogix",
+    [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+    [System.Windows.Forms.MessageBoxIcon]::Warning
+)
+
+if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK) {
+    Write-Host "Opération annulée par l'utilisateur."
+    exit
+}
+
+Write-Host "🔎 Fermeture des applications Microsoft 365..." -ForegroundColor Cyan
+
+# Liste des processus Office / M365 susceptibles de verrouiller les caches
+$ProcTargets = @(
+    "OUTLOOK","TEAMS","ONEDRIVE","WINWORD","EXCEL","POWERPNT",
+    "MSACCESS","VISIO","LYNC","ONENOTE",
+    "OfficeClickToRun","C2RClient","MSOSYNC","MSOIDSVC",
+    "msedgewebview2","SearchProtocolHost"
+)
+
+$CurrentSessionID = (Get-Process -Id $PID).SessionId
+
+foreach ($p in $ProcTargets) {
+    $Procs = Get-Process -Name $p -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $CurrentSessionID }
+    foreach ($proc in $Procs) {
+        try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+            Write-Host "✅ Processus $($proc.ProcessName) (PID $($proc.Id)) fermé." -ForegroundColor Green
+        } catch {
+            Write-Warning "Impossible de fermer $($proc.ProcessName) (PID $($proc.Id)) : $($_.Exception.Message)"
+        }
+    }
+}
+
+Start-Sleep -Seconds 2
+Write-Host "🧹 Fermeture des processus terminée. Passage à la purge des caches..." -ForegroundColor Cyan
+
+# --- Cibles à nettoyer (niveau 2 - complet et sûr pour FSLogix) ---
+$Targets = @(
+    "$env:LOCALAPPDATA\Microsoft\OneAuth",
+    "$env:LOCALAPPDATA\Microsoft\IdentityCache",
+    "$env:LOCALAPPDATA\Microsoft\TokenBroker",
+    "$env:LOCALAPPDATA\Microsoft\Office\16.0\WebServiceCache",
+    "$env:LOCALAPPDATA\Microsoft\Office\16.0\Wef",
+    "$env:LOCALAPPDATA\Microsoft\Office\16.0\Licensing",
+    "$env:LOCALAPPDATA\Microsoft\Office\16.0\Identity"
+)
+
+foreach ($path in $Targets) {
+    if (Test-Path $path) {
+        Write-Host "🧽 Nettoyage de $path..." -ForegroundColor Yellow
+        try {
+            Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Impossible de supprimer certains fichiers dans $path. Tentative de renommage..."
+            Get-ChildItem -Path $path -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Rename-Item -Path $_.FullName -NewName ($_.Name + ".bak") -ErrorAction Stop
+                } catch {
+                    Write-Warning "Fichier verrouillé non renommé : $($_.FullName)"
+                }
+            }
+            try {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warning "⚠️ Dossier encore partiellement verrouillé : $path"
+            }
+        }
+    } else {
+        Write-Host "ℹ️ Dossier introuvable : $path" -ForegroundColor DarkGray
+    }
+}
+
+Write-Host "✅ Purge terminée. Déconnectez-vous et reconnectez-vous pour régénérer les jetons d'identité (MFA)." -ForegroundColor Green
