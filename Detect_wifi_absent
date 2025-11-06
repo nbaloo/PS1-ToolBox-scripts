@@ -1,0 +1,46 @@
+# ====================================================================
+# QD - Détection carte Wi-Fi visible mais absente de la pile IP
+# ====================================================================
+
+Write-Host "=== Analyse des interfaces réseau ===`n"
+
+# 1️⃣ - Cartes physiques détectées par le gestionnaire de périphériques
+$physical = Get-NetAdapter -Physical | Where-Object { $_.InterfaceDescription -match "Wi-Fi|Wireless|802.11" }
+
+if ($physical) {
+    foreach ($card in $physical) {
+        Write-Host "Carte détectée : $($card.Name) [$($card.InterfaceDescription)]"
+        Write-Host " - Status OS  : $($card.Status)"
+        Write-Host " - MAC        : $($card.MacAddress)"
+        Write-Host " - GUID       : $($card.InterfaceGuid)"
+        Write-Host ""
+    }
+} else {
+    Write-Host "❌ Aucune carte Wi-Fi physique détectée par le système." -ForegroundColor Red
+}
+
+# 2️⃣ - Interfaces IP reconnues par la pile réseau (ipconfig équivalent)
+$ip = Get-NetIPConfiguration | Where-Object { $_.InterfaceAlias -match "Wi-Fi|Wireless|802.11" }
+
+if ($ip) {
+    Write-Host "=== Interfaces IP actives ===" -ForegroundColor Green
+    $ip | ForEach-Object {
+        Write-Host " - Interface : $($_.InterfaceAlias)"
+        Write-Host "   IPv4      : $($_.IPv4Address.IPAddress)"
+        Write-Host "   DNS       : $($_.DNSServer.ServerAddresses -join ', ')"
+        Write-Host ""
+    }
+} else {
+    Write-Host "⚠️ Aucune interface Wi-Fi n'est actuellement montée dans la pile IP." -ForegroundColor Yellow
+    Write-Host "(Symptôme typique : NSI / IP Helper / Wcmsvc non initialisés)"
+}
+
+# 3️⃣ - Résumé rapide
+Write-Host "`n=== Résumé ==="
+if ($physical -and -not $ip) {
+    Write-Host "🟠 Carte Wi-Fi détectée matériellement mais absente de la pile IP — pile réseau rompue." -ForegroundColor DarkYellow
+} elseif (-not $physical) {
+    Write-Host "🔴 Aucune carte Wi-Fi détectée — problème driver ou désactivation matérielle." -ForegroundColor Red
+} else {
+    Write-Host "🟢 Carte Wi-Fi opérationnelle — pile réseau active." -ForegroundColor Green
+}
