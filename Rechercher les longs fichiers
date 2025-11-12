@@ -1,0 +1,80 @@
+# ====================================================================
+# QD - Détection récursive de chemins > 260 caractères
+#      (option dossiers + affichage complet + plus long fichier)
+# ====================================================================
+
+$TargetFolder   = 'E:\DATA\Techniques\6000-6099\6011 MFILES\6011 - 41-appel offre\6011-Construction Bois\02_Version_02_Janvier_2023\Retour des offres'
+$IncludeFolders = $true     # 🔁 Inclure les dossiers dans le contrôle
+$ShowAll        = $true     # 👀 Afficher chaque élément analysé
+$MaxLength      = 260       # 🧱 Limite de longueur de chemin
+
+Write-Host "`nAnalyse du dossier : $TargetFolder`n" -ForegroundColor Cyan
+
+try {
+    $Items = Get-ChildItem -Path $TargetFolder -Recurse -Force -ErrorAction Stop
+}
+catch {
+    Write-Host "❌ Erreur lors de la lecture du dossier : $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+$CountTooLong = 0
+$CountTotal   = 0
+$LongestItem  = $null
+$LongestLen   = 0
+
+foreach ($Item in $Items) {
+
+    if (-not $IncludeFolders -and $Item.PSIsContainer) { continue }
+
+    $CountTotal++
+    $FullPath = $Item.FullName
+    $Len = $FullPath.Length
+
+    # Affichage de tout ce qui est contrôlé (mode debug)
+    if ($ShowAll) {
+        if ($Item.PSIsContainer) {
+            Write-Host "[CHECK DOSSIER]" -ForegroundColor DarkGray -NoNewline
+        } else {
+            Write-Host "[CHECK FICHIER]" -ForegroundColor Gray -NoNewline
+        }
+        Write-Host " $FullPath"
+    }
+
+    # Vérifie la longueur
+    if ($Len -gt $MaxLength) {
+        $CountTooLong++
+        if ($Item.PSIsContainer) {
+            Write-Host "[DOSSIER LONG] ($Len caractères) " -ForegroundColor Yellow -NoNewline
+        } else {
+            Write-Host "[FICHIER LONG] ($Len caractères) " -ForegroundColor Red -NoNewline
+        }
+        Write-Host "$FullPath"
+    }
+
+    # Suivi du plus long chemin rencontré
+    if ($Len -gt $LongestLen) {
+        $LongestLen  = $Len
+        $LongestItem = $Item
+    }
+}
+
+# Résumé final
+Write-Host "`n───────────────────────────────"
+Write-Host "📊 Total contrôlé : $CountTotal élément(s)" -ForegroundColor Cyan
+if ($CountTooLong -eq 0) {
+    Write-Host "✅ Aucun chemin > $MaxLength caractères détecté." -ForegroundColor Green
+} else {
+    Write-Host "⚠️  $CountTooLong élément(s) dépassent $MaxLength caractères." -ForegroundColor Yellow
+}
+Write-Host "───────────────────────────────"
+
+# Affichage du plus long élément détecté
+if ($null -ne $LongestItem) {
+    $type = if ($LongestItem.PSIsContainer) { "Dossier" } else { "Fichier" }
+    Write-Host "`n🏁 Plus long élément détecté :" -ForegroundColor Cyan
+    Write-Host "   Type       : $type"
+    Write-Host "   Longueur   : $LongestLen caractères"
+    Write-Host "   Chemin     : $($LongestItem.FullName)"
+}
+Write-Host ""
