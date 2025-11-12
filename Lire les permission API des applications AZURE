@@ -1,0 +1,90 @@
+# Creation par NGR - 16.06.2025 a l'aide de ChatGPT
+#
+# CSIRT - tebicom
+#
+#
+
+# SI JAMAIS INSTSALLE !!!!!!!!!!!!
+#Install-Module Microsoft.Graph -Scope CurrentUser
+
+# Connexion à Microsoft Graph
+Connect-MgGraph -Scopes "Application.Read.All", "DelegatedPermissionGrant.Read.All", "Directory.Read.All"
+
+# Cibles à rechercher (permissions sensibles)
+$targetPermissions = @("Files.ReadWrite.All", "Sites.ReadWrite.All", "AllSites.Write", "MyFiles.Write")
+
+# Récupérer le Service Principal de Microsoft Graph
+$graphSp = Get-MgServicePrincipal -Filter "displayName eq 'Microsoft Graph'"
+$graphAppId = $graphSp.AppId
+
+# Récupérer toutes les applications (Service Principals)
+$applications = Get-MgServicePrincipal -All
+
+# Stockage des résultats
+$results = @()
+
+foreach ($app in $applications) {
+    $appName = $app.DisplayName
+    $appId   = $app.AppId
+    $spId    = $app.Id
+
+    # Obtenir les propriétaires de l'application
+    $owners = Get-MgServicePrincipalOwner -ServicePrincipalId $spId -ErrorAction SilentlyContinue
+    $ownerNames = $owners | ForEach-Object {
+        if ($_.UserPrincipalName) { $_.UserPrincipalName } elseif ($_.DisplayName) { $_.DisplayName } else { "?" }
+    }
+    $ownerList = ($ownerNames -join "; ") -replace "`n", ""
+
+    # --- Vérification des permissions DELEGATED (déclarées dans Oauth2PermissionScopes) ---
+    foreach ($scope in $app.Oauth2PermissionScopes) {
+        if ($targetPermissions -contains $scope.Value -and $scope.ResourceAppId -eq $graphAppId) {
+            $results += [PSCustomObject]@{
+                ApplicationName = $appName
+                ApplicationId   = $appId
+                PermissionType  = "Delegated"
+                PermissionName  = $scope.Value
+                ConsentBy       = "Declared (check consent grants)"
+                Owners          = $ownerList
+            }
+        }
+    }
+
+    # --- Vérification des permissions APPLICATION (déclarées dans AppRoles) ---
+    foreach ($role in $app.AppRoles) {
+        if ($targetPermissions -contains $role.Value -and $role.ResourceAppId -eq $graphAppId) {
+            $results += [PSCustomObject]@{
+                ApplicationName = $appName
+                ApplicationId   = $appId
+                PermissionType  = "Application"
+                PermissionName  = $role.Value
+                ConsentBy       = "Declared (check admin consent)"
+                Owners          = $ownerList
+            }
+        }
+    }
+
+    # --- Vérification effective des consentements délégués ---
+    $grants = Get-MgOauth2PermissionGrant -Filter "clientId eq '$spId'" -ErrorAction SilentlyContinue
+    foreach ($grant in $grants) {
+        if ($grant.ResourceId -eq $graphSp.Id) {
+            $scopes = $grant.Scope -split ' '
+            foreach ($scope in $scopes) {
+                if ($targetPermissions -contains $scope) {
+                    $results += [PSCustomObject]@{
+                        ApplicationName = $appName
+                        ApplicationId   = $appId
+                        PermissionType  = "Delegated"
+                        PermissionName  = $scope
+                        ConsentBy       = if ($grant.ConsentType -eq "AllPrincipals") { "Admin Consent" } else { "User Consent ($($grant.PrincipalId))" }
+                        Owners          = $ownerList
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Export CSV
+$results | Export-Csv -Path "GraphSensitivePermissions_Audit.csv" -NoTypeInformation -Encoding UTF8
+
+Write-Host "✅ Export terminé : GraphSensitivePermissions_Audit.csv"
