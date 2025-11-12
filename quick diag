@@ -3,8 +3,7 @@ Script PowerShell
 Utilisé par Nicolas GRUBER - Tebicom | Généré avec l'aide de ChatGPT (OpenAI)
 Date intitiale : 27.09.2025
 Résumé : Pré-Diagnostic automatique complet Windows Server/Endpoint (user+admin compatible)
-
-Version 0.91 - 28.10.2025
+Version 0.92 - 12.11.2025
 #>
 
 cls
@@ -12,10 +11,16 @@ cls
 # To DO - récup taille profil utilisateur de merde 
 # TO DO - drivers - afficher date du pilote
 # Drvier printer - détecter les drivers postérieur à 2022
+# TO DO - printer simplementet
 
 # ====================================================================
 # QD - INITIALISATION : TRANSCRIPT GLOBAL
 # ====================================================================
+
+# Empêche les erreurs "Stop" d'être écrites dans le transcript
+$ErrorActionPreference = "Continue"
+$global:Error.Clear()
+
 try { #madebymoi with GhostEngineer
     if ($MyInvocation.MyCommand.Path) {
         $ScriptPath  = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -524,65 +529,37 @@ catch {
 
 
 # ====================================================================
-# QD - BLOC 5 : ADMINS LOCAUX
+# QD - BLOC 5 : COMPTES LOCAUX (ADMINS & AUTRES UTILISATEURS)
 # ====================================================================
-function Format-Text {
-    param(
-        [string]$text,
-        [int]$max
-    )
-    if ([string]::IsNullOrEmpty($text)) { return "" }
-    if ($text.Length -gt $max) {
-        return $text.Substring(0, $max - 3) + "..."
-    }
-    else {
-        return $text
-    }
-}
+$ADAvailable = (Get-Module -ListAvailable ActiveDirectory) -ne $null
+$Filter = 'AUTORITE NT|WsiAccount|Guest|Default|WDAG'
 
 Write-Host "`n=== Administrateurs locaux ===" -ForegroundColor Cyan
-try {
-    $LocalAdmins = Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop
-
-    if ($LocalAdmins) {
-        # Vérifie la disponibilité du module ActiveDirectory
-        $ADAvailable = Get-Module -ListAvailable -Name ActiveDirectory | ForEach-Object { $true }
-
-        foreach ($adm in $LocalAdmins) {
-            $name = $adm.Name
-            $cls  = $adm.ObjectClass
-
-            # Comptes inconnus (SID non résolu)
-            if ($adm.Name -match "^S-1-5-") {
-                $name = "[Inconnu] $($adm.Name)"
-                $cls  = "SID non résolu"
-            }
-
-            # Détection des comptes désactivés (si AD et module dispo)
-            if ($ADAvailable -and $adm.ObjectClass -eq 'User' -and $adm.PrincipalSource -eq 'ActiveDirectory') {
-                try {
-                    $user = Get-ADUser -Identity $adm.Name -Properties Enabled -ErrorAction Stop
-                    if (-not $user.Enabled) {
-                        $name += " [désactivé]"
-                    }
-                }
-                catch {
-                    # Ignorer les erreurs (compte non résolu ou pas dans AD)
-                }
-            }
-
-            $nameFmt = Format-Text $name 45
-            $clsFmt  = Format-Text $cls 20
-            Write-Host ("{0,-45} | {1}" -f $nameFmt, $clsFmt)
+$admins = @("S-1-5-32-544") | % { try { Get-LocalGroupMember -SID $_ -EA Stop } catch {} } | ? { $_.Name -notmatch $Filter }
+if ($admins) {
+    foreach ($m in $admins) {
+        $n = $m.Name
+        if ($ADAvailable -and $m.ObjectClass -eq 'User' -and $m.PrincipalSource -eq 'ActiveDirectory') {
+            try { if (-not (Get-ADUser -Id $m.Name -Prop Enabled -EA Stop).Enabled) { $n += " $(Write-Host '[désactivé]' -f DarkGray -NoNewline)" } } catch {}
         }
+        "{0,-45} | {1}" -f $n, $m.ObjectClass | Write-Host
     }
-    else {
-        Write-Host "Aucun administrateur local trouvé." -ForegroundColor Green
+} else { Write-Host "Aucun administrateur local trouvé." -f Green }
+
+Write-Host "`n=== Autres utilisateurs et groupes à privilèges ===" -ForegroundColor Cyan
+$SIDs = "S-1-5-32-545","S-1-5-32-547","S-1-5-32-548","S-1-5-32-549","S-1-5-32-550","S-1-5-32-551","S-1-5-32-555"
+$others = $SIDs | % { try { Get-LocalGroupMember -SID $_ -EA Stop } catch {} } | ? { $_.Name -notmatch $Filter } | sort Name -Unique
+if ($others) {
+    foreach ($m in $others) {
+        $n = $m.Name
+        if ($ADAvailable -and $m.ObjectClass -eq 'User' -and $m.PrincipalSource -eq 'ActiveDirectory') {
+            try { if (-not (Get-ADUser -Id $m.Name -Prop Enabled -EA Stop).Enabled) { $n += " $(Write-Host '[désactivé]' -f DarkGray -NoNewline)" } } catch {}
+        }
+        "{0,-45} | {1}" -f $n, $m.ObjectClass | Write-Host
     }
-}
-catch {
-    Write-Host "Non accessible (droits administrateur requis)" -ForegroundColor Yellow
-}
+} else { Write-Host "Aucun autre utilisateur trouvé." -f Green }
+
+Write-Host "`nℹ️  [désactivé] = Compte AD désactivé" -f DarkGray
 
 # ====================================================================
 # QD - BLOC 6 : PARTAGES LOCAUX
@@ -943,7 +920,7 @@ catch { Write-Host "Antivirus : Non accessible (droits admin requis)" -Foregroun
 try {
     $bl = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object {$_.VolumeType -eq "OperatingSystem"}
     if ($bl) { Write-Host "BitLocker : $($bl.ProtectionStatus)" }
-    else { Write-Host "BitLocker : Non disponible" }
+    else { Write-Host "BitLocker : (droits admin requis)" -ForegroundColor Yellow }
 }
 catch { Write-Host "BitLocker : Non accessible (droits admin requis)" -ForegroundColor Yellow }
 
@@ -1005,8 +982,6 @@ try {
     }
 }
 catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yellow }
-
-
 
 
 # ====================================================================
@@ -1145,7 +1120,6 @@ $apps = foreach ($path in $regPaths) {
 
 if ($apps) {
     $apps = $apps | Sort-Object Nom, Version -Unique
-    Write-Host "Total : $($apps.Count) applications détectées.`n" -ForegroundColor Green
     $apps | Format-Table -AutoSize
 }
 else {
@@ -1220,10 +1194,50 @@ catch { Write-Host "Non accessible (droits admin requis)" -ForegroundColor Yello
 # ====================================================================
 Write-Host "`n=== Périphériques en erreur (drivers) ===" -ForegroundColor Cyan
 try {
-    $badDevices = Get-CimInstance  Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 }
+    $badDevices = Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 }
+
+    # Table de correspondance des codes les plus fréquents
+    $errorMap = @{
+        1  = "Incorrectement configuré"
+        3  = "Pilote manquant"
+        10 = "Impossible de démarrer"
+        12 = "Conflit de ressources"
+        14 = "Doit être redémarré"
+        16 = "Pilote non installé correctement"
+        18 = "Requiert une réinstallation"
+        19 = "Pilote endommagé"
+        21 = "Non fonctionnel correctement"
+        22 = "Désactivé"
+        24 = "Non présent / supprimé"
+        28 = "Aucun pilote installé"
+        31 = "Échec du chargement du pilote"
+        32 = "Service de pilote désactivé"
+        33 = "Ressources invalides"
+        34 = "Configuration manuelle requise"
+        35 = "BIOS nécessite une mise à jour"
+        37 = "Pilote échoué au démarrage"
+        38 = "Pilote encore en mémoire"
+        39 = "Pilote corrompu / manquant"
+        40 = "Périphérique inconnu"
+        41 = "Conflit ou pilote en double"
+    }
+
+    # Liste des codes considérés comme "critiques"
+    $criticalCodes = @(10, 12, 19, 31, 37, 39, 41)
+
     if ($badDevices) {
-        foreach ($dev in $badDevices) {#madebygruber
-            Write-Host ("{0} | Code: {1}"  -f $dev.Name, $dev.ConfigManagerErrorCode)
+        foreach ($dev in $badDevices) {
+            $code = [int]$dev.ConfigManagerErrorCode
+            $desc = $errorMap[$code]
+            if (-not $desc) { $desc = "Code inconnu ($code)" }
+
+            # Couleur selon gravité
+            if ($criticalCodes -contains $code) {
+                Write-Host ("{0} | {1}" -f $dev.Name, $desc) -ForegroundColor Red
+            }
+            else {
+                Write-Host ("{0} | {1}" -f $dev.Name, $desc) -ForegroundColor Yellow
+            }
         }
     } else {
         Write-Host "Aucun périphérique en erreur détecté." -ForegroundColor Green
@@ -1232,6 +1246,7 @@ try {
 catch {
     Write-Host "Impossible de récupérer les périphériques." -ForegroundColor Yellow
 }
+
 
 # ====================================================================
 # QD - BLOC 15 : POLITIQUES (AD GPO ou MDM Intune)
