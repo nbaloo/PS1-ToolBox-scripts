@@ -1,7 +1,8 @@
 <#
 Script PowerShell
 Diag Windows – Arrêts et erreurs
-Date : 2025-09-22
+Date : 2025-09-22 
+Autor : Nicolas GRUBER
 #>
 cls
 # === Informations système ===
