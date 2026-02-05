@@ -1,17 +1,20 @@
 <#
 Script PowerShell
 Diag Windows – Arrêts et erreurs
-Date : 2025-09-22 
-Autor : Nicolas GRUBER
+Date : 2025-09-22
+Autor : GRUBER Nicolas 
 #>
 cls
 # === Informations système ===
 $fqdn = [System.Net.Dns]::GetHostByName(($env:COMPUTERNAME)).HostName
+$lastboot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 $ips  = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
          Where-Object { $_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1' }).IPAddress
 
 Write-Host "=== Diagnostic sur $fqdn ===" -ForegroundColor Cyan
 Write-Host "Adresse(s) IP : $($ips -join ', ')" -ForegroundColor Cyan
+Write-Host "Serveur Up depuis : "-ForegroundColor Cyan  $lastboot 
+
 Write-Host ""
 
 # === 5 derniers arrêts/reboots ===
