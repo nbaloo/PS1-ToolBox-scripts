@@ -1,0 +1,24 @@
+# ********************
+# Invoke commande avec controle de computer ON
+# ********************
+
+
+$Computers = @( "mon poste a auditer") #add computer with    
+#Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object Manufacturer, Model
+foreach ($Computer in $Computers) {
+if (-not (Test-Connection -ComputerName $Computer -Quiet -Count 1)) { write-host "Destination $Computer non joignable" -ForegroundColor Cyan; continue } # test ping et test WinRM ok
+Write-host  "#$Computer start invoke =================================================================================================" -ForegroundColor Cyan #-NoNewline
+#START OF INVOKE ***********************************************************************************************************************************************
+try {Invoke-Command -ComputerName $Computer -ErrorAction Stop -ScriptBlock  {
+# **************************************************************************************************************************************************************
+
+
+
+
+
+
+}} #END OF INVOKE ***********************************************************************************************************************************************
+# **************************************************************************************************************************************************************
+catch {write-host "invoke HS $Computer : $($_.Exception.Message)" -ForegroundColor Red; continue }
+Write-host  ""
+} #end of foreachk
