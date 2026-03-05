@@ -1,0 +1,81 @@
+# 1) Base OS (équivalent "Host OS language" / noyau)
+$nl = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language'
+$installHex = $nl.InstallLanguage
+$kernel = [cultureinfo]::GetCultureInfo([int]("0x$installHex")).Name
+
+# 1) System Locale legacy. OS (équivalent "defaut OS language" / noyau)
+$installHex_default = $nl.Default
+$kernel_default = [cultureinfo]::GetCultureInfo([int]("0x$installHex_default")).Name
+
+# 2) Preferred UI system (overlay)
+$mui = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\MUI\Settings' -ErrorAction SilentlyContinue
+$preferredSystemUI = $mui.PreferredUILanguages | Select-Object -First 1
+
+# 3) User UI culture (ce que .NET voit)
+$userUICulture = (Get-UICulture).Name
+
+# 4) Langues préférées utilisateur (ordre = important)
+$userLangList = Get-WinUserLanguageList
+$userPreferred = ($userLangList | ForEach-Object LanguageTag) -join ','
+
+# 5) Clavier / input methods (souvent le déclencheur de DE)
+$kbdTips = ($userLangList | ForEach-Object { $_.InputMethodTips }) | ForEach-Object { $_ } | Sort-Object -Unique
+$kbdTipsStr = ($kbdTips -join ',')
+
+# 6) MUI réellement installés (ce qui permet à DISM d’afficher DE/FR)
+$installedMUI = (Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\MUI\UILanguages' -ErrorAction SilentlyContinue |
+  Select-Object -ExpandProperty PSChildName) -join ','
+
+[PSCustomObject]@{
+  Computer            = $env:COMPUTERNAME
+  # Nom de la machine (utile pour inventaire parc / export CSV)
+
+  KERNEL_INTERFACE = "-----------------------------"
+  
+  Kernel_InstallLang  = "$installHex ($kernel)"
+  # Langue de base de l'image Windows (InstallLanguage dans NLS)
+  # C'est la langue du noyau / installation initiale utilisée par Windows Setup et DISM
+  # Exemple : 0409 = en-US
+
+  Systemlocal_default  = "$installHex_default ($kernel_default)"
+  #paramètre différent utilisé uniquement pour :applications non-Unicode anciennes API Windows codepages ANSI
+  
+  Installed_Kernel       = $installedMUI
+  # Packs de langue MUI réellement installés dans l'OS
+  # Source : HKLM\SYSTEM\CurrentControlSet\Control\MUI\UILanguages
+  # Indique quelles langues sont disponibles pour les applications et l'interface
+
+  USER_INTERFACE = "-----------------------------"
+
+  System_PreferredUI  = $preferredSystemUI
+  # Langue UI système préférée (overlay MUI)
+  # Définit la langue de l'interface Windows lorsque plusieurs packs sont installés
+  # Stockée dans : HKLM\SYSTEM\CurrentControlSet\Control\MUI\Settings\PreferredUILanguages
+
+    System_UILanguageOverride = if ((Get-WinUILanguageOverride).Name) { (Get-WinUILanguageOverride).Name } else { "NotSet" }
+    # Override de langue UI pour l’utilisateur courant.
+    # Prioritaire sur System_PreferredUI et l’ordre de Get-WinUserLanguageList.
+    # "NotSet" = aucun override configuré → Windows utilise User_LanguageList puis System_PreferredUI.
+
+  UI_RegionUICulture  = $userUICulture
+  # Langue UI du processus utilisateur (.NET / PowerShell)
+  # Détermine la langue utilisée par les applications .NET et certains outils CLI
+  # Obtenue via Get-UICulture
+
+   UI_FormatRegion  = (Get-Culture).Name
+  # culture régionale active pour l’utilisateur courant
+
+  UI_PrimaryLanguage = (Get-WinUserLanguageList)[0].LanguageTag
+  # Première langue dans la liste des langues utilisateur
+  # C'est généralement celle utilisée par les applications Win32 pour choisir leurs ressources MUI
+  # Elle influence souvent la langue d'outils comme DISM
+
+  UI_LanguageList   = $userPreferred
+  # Liste complète des langues utilisateur par ordre de préférence
+  # Windows utilise cet ordre pour résoudre les ressources linguistiques
+
+  InputMethodTips     = $kbdTipsStr
+  # Claviers / Input Method actifs associés aux langues
+  # Peut influencer la langue choisie par certaines applications Win32
+
+}
