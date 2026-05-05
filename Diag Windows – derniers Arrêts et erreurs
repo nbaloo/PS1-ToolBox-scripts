@@ -1,7 +1,7 @@
-  <#
+      <#
 Script PowerShell
 Diag Windows – Arrêts et erreurs
-Date : 2025-09-22
+Date : 2026-05-05
 Autor : GRUBER Nicolas 
 #>
 cls
@@ -18,19 +18,100 @@ Write-Host "Serveur Up depuis : "-ForegroundColor Cyan  $lastboot
 Write-Host ""
 
 # === 5 derniers arrêts/reboots ===
-Write-Host "=== 5 derniers arrêts/reboots ===" -ForegroundColor Cyan
-$shutdowns = Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=41 or EventID=1074 or EventID=6006 or EventID=6008)]]" -MaxEvents 5 |
-             Sort-Object TimeCreated -Descending
+# ====================================================================
+# QD - 5 derniers arrêts/reboots détaillés
+# ====================================================================
+Write-Host "`n=== 5 derniers arrêts/reboots détaillés ===" -ForegroundColor Cyan
+
+$events = Get-WinEvent -FilterHashtable @{
+    LogName = 'System'
+    Id      = 41,1074,6005,6006,6008,12,13,1001
+} -MaxEvents 200 |
+Sort-Object TimeCreated -Descending |
+Select-Object -First 20
+
+$shutdowns = $events | Where-Object { $_.Id -in 41,1074,6006,6008,13,1001 } | Select-Object -First 5
 
 foreach ($s in $shutdowns) {
-    switch ($s.Id) {
-        1074 { $type = "Arrêt initié (user/process)" }
-        6006 { $type = "Arrêt normal" }
-        6008 { $type = "Arrêt inattendu" }
-        41   { $type = "Arrêt brutal (Kernel-Power)" }
-        default { $type = "Autre" }
+
+    $xml = [xml]$s.ToXml()
+    $data = @{}
+    foreach ($d in $xml.Event.EventData.Data) {
+        if ($d.Name) { $data[$d.Name] = $d.'#text' }
     }
-    Write-Host ("{0:yyyy-MM-dd HH:mm:ss} - {1}" -f $s.TimeCreated, $type) -ForegroundColor Yellow
+
+    switch ($s.Id) {
+        1074 {
+            $type = "Arrêt/redémarrage initié proprement"
+            $details = @(
+                "Processus : $($data['param1'])"
+                "Utilisateur : $($data['param7'])"
+                "Type : $($data['param2'])"
+                "Raison : $($data['param3'])"
+                "Code raison : $($data['param4'])"
+                "Commentaire : $($data['param5'])"
+            )
+        }
+
+        6006 {
+            $type = "Arrêt normal du service EventLog"
+            $details = @(
+                "Indique généralement un arrêt propre de Windows."
+            )
+        }
+
+        6008 {
+            $type = "Arrêt inattendu détecté"
+            $details = @(
+                "Windows indique que l’arrêt précédent n’était pas propre."
+                "À corréler avec Kernel-Power 41, BugCheck 1001 ou coupure électrique."
+            )
+        }
+
+        41 {
+            $type = "Arrêt brutal / perte d’alimentation / reset forcé"
+            $details = @(
+                "BugcheckCode : $($data['BugcheckCode'])"
+                "BugcheckParameter1 : $($data['BugcheckParameter1'])"
+                "BugcheckParameter2 : $($data['BugcheckParameter2'])"
+                "BugcheckParameter3 : $($data['BugcheckParameter3'])"
+                "BugcheckParameter4 : $($data['BugcheckParameter4'])"
+                "SleepInProgress : $($data['SleepInProgress'])"
+                "PowerButtonTimestamp : $($data['PowerButtonTimestamp'])"
+                "BootAppStatus : $($data['BootAppStatus'])"
+            )
+        }
+
+        13 {
+            $type = "Arrêt OS confirmé par Kernel-General"
+            $details = @(
+                "Windows a enregistré l’arrêt du système."
+            )
+        }
+
+        1001 {
+            $type = "BugCheck / BSOD"
+            $details = @(
+                "Possible écran bleu avant redémarrage."
+                "Message : $($s.Message)"
+            )
+        }
+
+        default {
+            $type = "Événement système"
+            $details = @($s.Message)
+        }
+    }
+
+    Write-Host ("{0:yyyy-MM-dd HH:mm:ss} [ID {1}] {2}" -f $s.TimeCreated, $s.Id, $type) -ForegroundColor Yellow
+
+    foreach ($line in $details) {
+        if ($line -and $line.Trim() -ne "") {
+            Write-Host "   $line" -ForegroundColor DarkYellow
+        }
+    }
+
+    Write-Host ""
 }
 
 # === 10 dernières erreurs/critiques ===
@@ -45,3 +126,4 @@ foreach ($e in $errors) {
     Write-Host ("   {0}" -f $e.Message) -ForegroundColor DarkYellow
     Write-Host ""
 }
+
