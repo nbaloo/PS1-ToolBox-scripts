@@ -1,0 +1,353 @@
+$BasePath = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+Write-Log "------------------------------------------------------------------------------------------------------------------ START script ------------------------------------------------------------------------------------------------------------------"
+
+# Script par Nicolas GRUBER - suppression old profil next gen 
+# 07.02.2026
+# BLOC1 -------------------------------------- VARIABLES SCRIPT MODIFIABLES ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+$ProfileAgeDays = 60
+$SimulationMode = $false
+$DeleteLocalProfiles = $false
+
+$ProtectedProfiles = @(
+    $env:USERNAME,
+    "*Nexus*"
+)
+
+$LogPath = Join-Path $BasePath "AutoClean.log"
+
+
+# BLOC2 -------------------------------------- VARIABLES INTERNES / FUNCTIONS ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+$ComputerName = $env:COMPUTERNAME
+
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp [$Level] - $Message"
+    [System.IO.File]::AppendAllText($LogPath, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+}
+
+function Convert-ProfileLoadTime {
+    param (
+        [UInt32]$High,
+        [UInt32]$Low
+    )
+
+    $fileTime = ([Int64]$High -shl 32) -bor ([UInt32]$Low)
+
+    if ($fileTime -le 0) {
+        return $null
+    }
+
+    return [DateTime]::FromFileTime($fileTime)
+}
+
+function Get-ProfileAgeText {
+    param (
+        [Nullable[DateTime]]$LastLoadTime
+    )
+
+    if (-not $LastLoadTime) {
+        return "Aucune valeur"
+    }
+
+    $days = [math]::Floor(((Get-Date) - $LastLoadTime).TotalDays)
+    return "$($LastLoadTime.ToString("yyyy-MM-dd HH:mm:ss")) / ($days jours)"
+}
+
+function Test-SystemProfile {
+    param (
+        [string]$Account,
+        [string]$ProfilePath
+    )
+
+    if ($Account -like "AUTORITE NT\*" -or $Account -like "NT AUTHORITY\*") {
+        return $true
+    }
+
+    if ($ProfilePath -like "$env:SystemRoot\ServiceProfiles\*") {
+        return $true
+    }
+
+    if ($ProfilePath -like "$env:SystemDrive\Users\Default*" -or
+        $ProfilePath -like "$env:SystemDrive\Users\Public*" -or
+        $ProfilePath -like "$env:SystemDrive\Users\All Users*") {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-ProfileAccountType {
+    param (
+        [string]$Account,
+        [string]$ProfilePath,
+        [string]$ComputerName
+    )
+
+    if ($Account -eq "SID_NON_RESOLU") {
+        return "UNKNOWN"
+    }
+
+    if (Test-SystemProfile -Account $Account -ProfilePath $ProfilePath) {
+        return "SYSTEM"
+    }
+
+    if ($Account -like "$ComputerName\*") {
+        return "LOCAL"
+    }
+
+    if ($Account -match '^[^\\]+\\[^\\]+$') {
+        return "DOMAIN"
+    }
+
+    return "UNKNOWN"
+}
+
+function Test-ProtectedProfile {
+    param (
+        [string]$ProfileDir,
+        [string[]]$ProtectedPatterns
+    )
+
+    foreach ($pattern in $ProtectedPatterns) {
+        if ($ProfileDir -like $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+
+# BLOC3 -------------------------------------- RECHERCHE PROFILS + FILTRAGE LOCALPROFILELOADTIME ------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+Write-Log "Machine locale : $ComputerName"
+Write-Log "Seuil d'inactivité profil local : $ProfileAgeDays jours"
+Write-Log "Mode simulation : $SimulationMode"
+Write-Log "Suppression profils locaux activée : $DeleteLocalProfiles"
+
+$ProfileRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+$CutoffDate = (Get-Date).AddDays(-$ProfileAgeDays)
+
+Write-Log "Date limite : $($CutoffDate.ToString("yyyy-MM-dd HH:mm:ss"))"
+Write-Log "Profils protégés personnalisés : $($ProtectedProfiles -join ', ')"
+
+$AllProfiles = Get-ChildItem $ProfileRegPath -ErrorAction SilentlyContinue | ForEach-Object {
+
+    $sid = $_.PSChildName
+    $profile = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+
+    if (-not $profile.ProfileImagePath) {
+        return
+    }
+
+    try {
+        $account = ([System.Security.Principal.SecurityIdentifier]$sid).
+            Translate([System.Security.Principal.NTAccount]).Value
+    }
+    catch {
+        $account = "SID_NON_RESOLU"
+    }
+
+    $lastLoadTime = $null
+
+    if ($null -ne $profile.LocalProfileLoadTimeHigh -and $null -ne $profile.LocalProfileLoadTimeLow) {
+        $lastLoadTime = Convert-ProfileLoadTime `
+            -High ([UInt32]$profile.LocalProfileLoadTimeHigh) `
+            -Low ([UInt32]$profile.LocalProfileLoadTimeLow)
+    }
+
+    $profileDir = Split-Path $profile.ProfileImagePath -Leaf
+
+    $accountType = Get-ProfileAccountType `
+        -Account $account `
+        -ProfilePath $profile.ProfileImagePath `
+        -ComputerName $ComputerName
+
+    [PSCustomObject]@{
+        Sid          = $sid
+        Account      = $account
+        AccountType  = $accountType
+        ProfileDir   = $profileDir
+        Path         = $profile.ProfileImagePath
+        LastLoadTime = $lastLoadTime
+    }
+}
+
+$DomainProfiles  = $AllProfiles | Where-Object { $_.AccountType -eq "DOMAIN" }
+$LocalProfiles   = $AllProfiles | Where-Object { $_.AccountType -eq "LOCAL" }
+$SystemProfiles  = $AllProfiles | Where-Object { $_.AccountType -eq "SYSTEM" }
+$UnknownProfiles = $AllProfiles | Where-Object { $_.AccountType -eq "UNKNOWN" }
+
+
+Write-Log "-------------------------------------------------------------------------------------------------------"
+Write-Log "Nombre total de profils détectés : $(($AllProfiles | Measure-Object).Count)"
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS DOMAINE -------------------------------------------------"
+Write-Log "Nombre de profils domaine détectés : $(($DomainProfiles | Measure-Object).Count)"
+
+foreach ($profile in $DomainProfiles) {
+    Write-Log "Profil domaine : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+}
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS LOCAUX MACHINE  -------------------------------------------------"
+Write-Log "Nombre de profils locaux machine détectés : $(($LocalProfiles | Measure-Object).Count)"
+
+foreach ($profile in $LocalProfiles) {
+    Write-Log "Profil local machine : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+}
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS SYSTEME (exempté obligatoire ) ------------------------------------------------"
+Write-Log "Nombre de profils système détectés : $(($SystemProfiles | Measure-Object).Count)"
+
+foreach ($profile in $SystemProfiles) {
+    Write-Log "Profil système : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path)"
+}
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS INCONNUS / NON RESOLUS ------------------------------------------------"
+Write-Log "Nombre de profils inconnus détectés : $(($UnknownProfiles | Measure-Object).Count)"
+
+foreach ($profile in $UnknownProfiles) {
+    Write-Log "Profil inconnu ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)" "WARN"
+}
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS UTILISATEURS EXEMPTES ------------------------------------------------"
+
+$ExemptProfiles = $AllProfiles | Where-Object {
+    Test-ProtectedProfile `
+        -ProfileDir $_.ProfileDir `
+        -ProtectedPatterns $ProtectedProfiles
+}
+
+Write-Log "Nombre de profils exemptés : $(($ExemptProfiles | Measure-Object).Count)"
+
+foreach ($profile in $ExemptProfiles) {
+    Write-Log "Profil exempté : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path)"
+}
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS CANDIDATS SUPPRESSION ------------------------------------------------"
+
+$CandidateProfiles = if ($DeleteLocalProfiles) {
+    $DomainProfiles + $LocalProfiles
+}
+else {
+    $DomainProfiles
+}
+
+$ProfilesToDelete = $CandidateProfiles | Where-Object {
+    $_.LastLoadTime -and
+    $_.LastLoadTime -lt $CutoffDate -and
+    -not (Test-ProtectedProfile `
+    -ProfileDir $_.ProfileDir `
+    -ProtectedPatterns $ProtectedProfiles)
+}
+
+Write-Log "Nombre de profils candidats suppression : $(($ProfilesToDelete | Measure-Object).Count)"
+
+foreach ($profile in $ProfilesToDelete) {
+    Write-Log "Candidat suppression : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+}
+
+
+# BLOC4 -------------------------------------- NETTOYAGE PROFIL UTILISATEUR AVEC WIN32_USERPROFILE --------------------------------------------------------------------------------------------------------------------------------------------------------
+
+$DeletedCount = 0
+$SkippedCount = 0
+$ErrorCount   = 0
+Write-Log ""
+
+if (-not $ProfilesToDelete -or ($ProfilesToDelete | Measure-Object).Count -eq 0) {
+    Write-Log "Aucun profil éligible à la suppression - Remove-CimInstance non exécuté" "WARN"
+}
+else {
+    if ($SimulationMode) {
+        Write-Log "********************* SIMULATION *****************************" "WARN"
+    }
+    else {
+        Write-Log "********************* EFFACEMENT *****************************" "WARN"
+    }
+
+    try {
+        $CimProfiles = Get-CimInstance Win32_UserProfile -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Impossible de récupérer Win32_UserProfile : $($_.Exception.Message)" "ERROR"
+        exit 1
+    }
+
+    $CimProfilesBySid = @{}
+
+    foreach ($cim in $CimProfiles) {
+        if ($cim.SID -and -not $CimProfilesBySid.ContainsKey($cim.SID)) {
+            $CimProfilesBySid[$cim.SID] = $cim
+        }
+    }
+
+    foreach ($profile in $ProfilesToDelete) {
+
+        if (-not $CimProfilesBySid.ContainsKey($profile.Sid)) {
+            Write-Log "Profil CIM introuvable : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARN"
+            $SkippedCount++
+            continue
+        }
+
+        $cimProfile = $CimProfilesBySid[$profile.Sid]
+
+        if ($cimProfile.Special) {
+            Write-Log "Profil spécial ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARN"
+            $SkippedCount++
+            continue
+        }
+
+        if ($cimProfile.Loaded) {
+            Write-Log "Profil chargé/en cours d'utilisation ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARN"
+            $SkippedCount++
+            continue
+        }
+
+        if ($SimulationMode) {
+            Write-Log "SIMULATION - Profil qui serait supprimé : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)"
+            $SkippedCount++
+            continue
+        }
+
+        try {
+            Write-Log ""
+            Write-Log "Début nettoyage : $profile"
+            Remove-CimInstance -InputObject $cimProfile -ErrorAction Stop -WarningAction SilentlyContinue
+            Write-Log "Profil supprimé via Win32_UserProfile : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)"
+            $DeletedCount++
+        }
+        catch {
+            Write-Log "Erreur suppression profil CIM : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path) | $($_.Exception.Message)" "ERROR"
+            $ErrorCount++
+        }
+          Write-Log ""
+    }
+  
+    Write-Log "Résumé nettoyage profils : Supprimés=$DeletedCount | Ignorés=$SkippedCount | Erreurs=$ErrorCount"
+}
+
+
+# BLOC5 -------------------------------------- FIN ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Write-Log "------------------------------------------------------------------------------------------------------------------ END script ------------------------------------------------------------------------------------------------------------------"
+
+if ($ErrorCount -gt 0) {
+    exit 1
+}
+
+exit 0
