@@ -1,144 +1,240 @@
-$BasePath = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-Write-Log "------------------------------------------------------------------------------------------------------------------ START script ------------------------------------------------------------------------------------------------------------------"
 
 # Script par Nicolas GRUBER - suppression old profil next gen 
-# 07.02.2026
+# 08.05.2026
+
 # BLOC1 -------------------------------------- VARIABLES SCRIPT MODIFIABLES ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-$ProfileAgeDays = 60
-$SimulationMode = $false
-$DeleteLocalProfiles = $false
+# modifiable à la main ou via injection d'arguments ex : 
+# -NoProfile -File "%ProgramFiles%\HFR\AutoClean.ps1" -LogPath "C:\Scripts\Logs\AutoClean.log" -ProfileAgeDays 90 -SimulationMode $false -DeleteLocalProfiles $false -CleanOrphanProfiles $false -ProtectedProfiles "admt2-*","*nexus*","svc-*" -CalculateProfileSize $true -MaxSeconds 2 -bypassServerProtection $false
 
-$ProtectedProfiles = @(
-    $env:USERNAME,
-    "*Nexus*"
+param (
+    [int]$ProfileAgeDays = 60,
+
+    [bool]$SimulationMode = $true,
+
+    [bool]$DeleteLocalProfiles = $false,
+
+    [bool]$CleanOrphanProfiles = $false,
+
+    [string[]]$ProtectedProfiles = @(
+        $env:USERNAME,
+        "*nexus*" ),
+
+    [string]$LogPath,
+
+    [bool]$CalculateProfileSize = $true,
+
+    [int]$MaxSeconds = 2,
+
+    [bool]$BypassServerProtection = $false
 )
 
-$LogPath = Join-Path $BasePath "AutoClean.log"
+#Garde-fou avant script pour augmenter à minima à 7 jours la délai de nettoyage - RECCOMANDATION DE NE PAS SUPPRIMER
+    if ($ProfileAgeDays -lt 7) {
+    $warningagedays= true
+    $ProfileAgeDays = 7
+        }
 
+##############################################################################################################
+#                                                                                                            #
+#                                                                                                            #
+#                                                                                                            #
+#                                                                                                            #
+#                              Fin des valeurs modifiables recommandées                                      #
+#                                                                                                            #
+#                                                                                                            #
+#                                                                                                            #
+#                                                                                                            #
+##############################################################################################################
+
+# BLOC1 bis -------------------------------------- TRAITEMENT VARIABLES ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Récupération du dossier d'emplacement du script
+    $BasePath = if ($PSScriptRoot) {
+        $PSScriptRoot
+    } else {  Split-Path -Parent $MyInvocation.MyCommand.Path }
+
+# Définition du chemin de log / si pas argumenté, on utilise le chemin par défaut
+    if ($LogPath) { if (Test-Path $LogPath -PathType Container) {  $LogPath = Join-Path $LogPath "AutoClean.log"    }
+    }  else {  $LogPath = Join-Path $BasePath "AutoClean.log"  }
+
+# Création du dossier de log si absent
+    $LogDirectory = Split-Path -Parent $LogPath
+    if (-not (Test-Path $LogDirectory)) {   New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null}
+
+$ProtectedProfiles = @($ProtectedProfiles) + @(
+        $env:USERNAME,
+        "admin*",
+        "adm-*",
+        "admin-*",
+        "svc-*",
+        "service-*"
+    ) | Select-Object -Unique
+
+$ProtectedOrphanFolders = @($ProtectedProfiles) + @(
+        "Default"
+        "Default User"
+        "Public"
+        "All Users"
+        "WDAGUtilityAccount"
+        "defaultuser0"
+        "defaultuser100000"
+        "Administrator"
+        "Administrateur"
+        "DefaultAppPool"
+    ) | Select-Object -Unique
 
 # BLOC2 -------------------------------------- VARIABLES INTERNES / FUNCTIONS ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 $ComputerName = $env:COMPUTERNAME
 
-function Write-Log {
+
+function Write-Log { #créer un fonction de write-log pour CMTrace
     param (
         [string]$Message,
         [string]$Level = "INFO"
     )
-
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$timestamp [$Level] - $Message"
     [System.IO.File]::AppendAllText($LogPath, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
 }
 
-function Convert-ProfileLoadTime {
+function Convert-ProfileLoadTime { # fonction d'assemblage des HIGH et LOW dans le profil list pour déterminer la DATE de la dernière connexion
     param (
         [UInt32]$High,
-        [UInt32]$Low
-    )
-
+        [UInt32]$Low    )
     $fileTime = ([Int64]$High -shl 32) -bor ([UInt32]$Low)
-
-    if ($fileTime -le 0) {
-        return $null
-    }
-
+    if ($fileTime -le 0) { return $null    }
     return [DateTime]::FromFileTime($fileTime)
 }
 
-function Get-ProfileAgeText {
-    param (
-        [Nullable[DateTime]]$LastLoadTime
-    )
-
-    if (-not $LastLoadTime) {
-        return "Aucune valeur"
-    }
-
+function Get-ProfileAgeText { # créer un valeur en jour de la dernière ouverture de session 
+    param (   [Nullable[DateTime]]$LastLoadTime    )
+    if (-not $LastLoadTime) {    return "Aucune valeur"   }
     $days = [math]::Floor(((Get-Date) - $LastLoadTime).TotalDays)
     return "$($LastLoadTime.ToString("yyyy-MM-dd HH:mm:ss")) / ($days jours)"
 }
 
-function Test-SystemProfile {
+function Test-ProtectedOrphanFolder { 
     param (
-        [string]$Account,
-        [string]$ProfilePath
+        [string]$FolderName,
+        [string[]]$ProtectedPatterns
     )
 
-    if ($Account -like "AUTORITE NT\*" -or $Account -like "NT AUTHORITY\*") {
-        return $true
+    foreach ($pattern in $ProtectedPatterns) {
+        if ($FolderName -like $pattern) {
+            return $true
+        }
     }
-
-    if ($ProfilePath -like "$env:SystemRoot\ServiceProfiles\*") {
-        return $true
-    }
-
-    if ($ProfilePath -like "$env:SystemDrive\Users\Default*" -or
-        $ProfilePath -like "$env:SystemDrive\Users\Public*" -or
-        $ProfilePath -like "$env:SystemDrive\Users\All Users*") {
-        return $true
-    }
-
     return $false
 }
 
-function Get-ProfileAccountType {
+function Test-SystemProfile {  # lister les profils système
+    param (
+        [string]$Account
+    )
+
+    if ($Account -like "AUTORITE NT\*" -or
+        $Account -like "NT AUTHORITY\*" -or
+        $Account -like "NT SERVICE\*" -or
+        $Account -like "Window Manager\*" -or
+        $Account -like "Font Driver Host\*" -or
+        $Account -like "UMFD-*" -or
+        $Account -like "DWM-*") {
+        return $true
+    }
+    return $false
+}
+
+function Get-ProfileAccountType { #récupérer le type de compte - AD / spécial / inconu / local
     param (
         [string]$Account,
         [string]$ProfilePath,
         [string]$ComputerName
     )
-
-    if ($Account -eq "SID_NON_RESOLU") {
-        return "UNKNOWN"
-    }
-
-    if (Test-SystemProfile -Account $Account -ProfilePath $ProfilePath) {
-        return "SYSTEM"
-    }
-
-    if ($Account -like "$ComputerName\*") {
-        return "LOCAL"
-    }
-
-    if ($Account -match '^[^\\]+\\[^\\]+$') {
-        return "DOMAIN"
-    }
-
+    if ($Account -eq "SID_NON_RESOLU") {     return "UNKNOWN" }
+    if (Test-SystemProfile -Account $Account) { return "SYSTEM" }
+    if ($Account -like "$ComputerName\*") {     return "LOCAL"    }
+    if ($Account -like "AzureAD\*") {    return "CLOUD"}
+    if ($Account -like "MicrosoftAccount\*") {    return "CLOUD" }
+    if ($Account -match '^[^\\]+\\[^\\]+$') {      return "DOMAIN"   }
     return "UNKNOWN"
 }
 
-function Test-ProtectedProfile {
+function Test-ProtectedProfile { #exlcusion des profils définit
     param (
         [string]$ProfileDir,
+        [string]$Account,
         [string[]]$ProtectedPatterns
     )
-
     foreach ($pattern in $ProtectedPatterns) {
-        if ($ProfileDir -like $pattern) {
-            return $true
-        }
+        if ($ProfileDir -like $pattern) {      return $true      }
+        if ($Account -like $pattern) {        return $true        }
     }
-
     return $false
 }
+
+function Get-ProfileSizeMB { #calculer taille folder avec limitation de temps par test
+    param (
+        [string]$Path,
+        [int]$MaxSeconds    )
+        $stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $totalSize = 0
+    try { Get-ChildItem $Path -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $totalSize += $_.Length
+            if ($stopWatch.Elapsed.TotalSeconds -ge $MaxSeconds) {
+                throw "TIMEOUT"      }   }
+        return [math]::Round($totalSize / 1MB, 2)    }
+        catch {     return [math]::Round($totalSize / 1MB, 2)   }
+    }
+
+Write-Log "------------------------------------------------------------------------------------------------------------------ START Logging ------------------------------------------------------------------------------------------------------------------"
+
+# On controle que le script est exécuté en admin 
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
+
+if ( $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {write-host "droit admin OK début du script"}
+
+if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    write-host "droit admin PAS OK stop du script"
+
+    if ($SimulationMode) { Write-Log "Le script n'est pas exécuté avec des privilèges administrateur - mode simulation uniquement" "WARNING" }
+    else { Write-Log "Le script doit être exécuté avec des privilèges administrateur pour effectuer des suppressions - arrêt du script" "ERROR"
+        exit 1 } }
+
+if ($warningagedays) { Write-Log "Valeur ProfileAgeDays trop basse - seuil minimum de sécurité appliqué automatiquement : 7 jours" "WARNING"  }
+
+#Garde-fou si on démarre sur un serveur = SIMLULATION - bypassable en forçant la commande 
+$IsServer = (Get-CimInstance Win32_OperatingSystem).ProductType -ne 1
+if ($IsServer -and -not $BypassServerProtection) {
+    $SimulationMode = $true
+    Write-Log "Serveur Windows détecté : simulation forcée" "ERROR"
+}
+
 
 
 # BLOC3 -------------------------------------- RECHERCHE PROFILS + FILTRAGE LOCALPROFILELOADTIME ------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+Write-Log "------------------------------------------------------------------------------------------------------------------ START script ------------------------------------------------------------------------------------------------------------------"
 
+Write-log "---------START Paramètre script---------" 
 Write-Log "Machine locale : $ComputerName"
 Write-Log "Seuil d'inactivité profil local : $ProfileAgeDays jours"
 Write-Log "Mode simulation : $SimulationMode"
 Write-Log "Suppression profils locaux activée : $DeleteLocalProfiles"
+Write-Log "Suppression Dossiers orphelins : $CleanOrphanProfiles"
+Write-Log "Calcul tailles des dossiers activé : $CalculateProfileSize"
 
 $ProfileRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
 $CutoffDate = (Get-Date).AddDays(-$ProfileAgeDays)
 
 Write-Log "Date limite : $($CutoffDate.ToString("yyyy-MM-dd HH:mm:ss"))"
 Write-Log "Profils protégés personnalisés : $($ProtectedProfiles -join ', ')"
+if ($CalculateProfileSize) { Write-Log "Calcul taille profil activé : max $MaxSeconds secondes par profil - résultat approximatif" "WARNING" }
+Write-log "---------END Paramètre---------" 
 
+#--------------------------------- Recherche profil dans le registre --------------------------------
 $AllProfiles = Get-ChildItem $ProfileRegPath -ErrorAction SilentlyContinue | ForEach-Object {
 
     $sid = $_.PSChildName
@@ -171,23 +267,46 @@ $AllProfiles = Get-ChildItem $ProfileRegPath -ErrorAction SilentlyContinue | For
         -ProfilePath $profile.ProfileImagePath `
         -ComputerName $ComputerName
 
+    if ($CalculateProfileSize) {
+        $profileSizeMB = Get-ProfileSizeMB `
+            -Path $profile.ProfileImagePath `
+            -MaxSeconds $MaxSeconds
+    }
+    else {
+        $profileSizeMB = $null
+    }
+
     [PSCustomObject]@{
-        Sid          = $sid
-        Account      = $account
-        AccountType  = $accountType
-        ProfileDir   = $profileDir
-        Path         = $profile.ProfileImagePath
-        LastLoadTime = $lastLoadTime
+        Sid           = $sid
+        Account       = $account
+        AccountType   = $accountType
+        ProfileDir    = $profileDir
+        Path          = $profile.ProfileImagePath
+        LastLoadTime  = $lastLoadTime
+        ProfileSizeMB = $profileSizeMB
     }
 }
 
+# Analyse dossiers C:\Users sans référence registre ProfileList
+
+$UserFolders = Get-ChildItem "$env:SystemDrive\Users" -Directory -Force -ErrorAction SilentlyContinue
+
+$ProfilePathsFromRegistry = $AllProfiles.Path | ForEach-Object {
+    $_.TrimEnd('\')
+}
+
+$OrphanUserFolders = $UserFolders | Where-Object {
+    $_.FullName.TrimEnd('\') -notin $ProfilePathsFromRegistry
+}
+
 $DomainProfiles  = $AllProfiles | Where-Object { $_.AccountType -eq "DOMAIN" }
+$CloudProfiles   = $AllProfiles | Where-Object { $_.AccountType -eq "CLOUD" }
 $LocalProfiles   = $AllProfiles | Where-Object { $_.AccountType -eq "LOCAL" }
 $SystemProfiles  = $AllProfiles | Where-Object { $_.AccountType -eq "SYSTEM" }
 $UnknownProfiles = $AllProfiles | Where-Object { $_.AccountType -eq "UNKNOWN" }
 
 
-Write-Log "-------------------------------------------------------------------------------------------------------"
+Write-Log "********************************************** PROFILS WINDOWS avec CimINSTANCE **********************************************"
 Write-Log "Nombre total de profils détectés : $(($AllProfiles | Measure-Object).Count)"
 
 Write-Log ""
@@ -195,23 +314,31 @@ Write-Log "--------------------------- PROFILS DOMAINE -------------------------
 Write-Log "Nombre de profils domaine détectés : $(($DomainProfiles | Measure-Object).Count)"
 
 foreach ($profile in $DomainProfiles) {
-    Write-Log "Profil domaine : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+    Write-Log "Profil domaine : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
 }
 
 Write-Log ""
-Write-Log "--------------------------- PROFILS LOCAUX MACHINE  -------------------------------------------------"
+Write-Log "--------------------------- PROFILS CLOUD / AzureAD -------------------------------------------------"
+Write-Log "Nombre de profils cloud détectés : $(($CloudProfiles | Measure-Object).Count)"
+
+foreach ($profile in $CloudProfiles) {
+    Write-Log "Profil cloud : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+}
+
+Write-Log ""
+Write-Log "--------------------------- PROFILS LOCAUX MACHINE -------------------------------------------------"
 Write-Log "Nombre de profils locaux machine détectés : $(($LocalProfiles | Measure-Object).Count)"
 
 foreach ($profile in $LocalProfiles) {
-    Write-Log "Profil local machine : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+    Write-Log "Profil local machine : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
 }
 
 Write-Log ""
-Write-Log "--------------------------- PROFILS SYSTEME (exempté obligatoire ) ------------------------------------------------"
+Write-Log "--------------------------- PROFILS SYSTEME EXEMPTES OBLIGATOIRES ------------------------------------------------"
 Write-Log "Nombre de profils système détectés : $(($SystemProfiles | Measure-Object).Count)"
 
 foreach ($profile in $SystemProfiles) {
-    Write-Log "Profil système : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path)"
+    Write-Log "Profil système : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path)"
 }
 
 Write-Log ""
@@ -219,7 +346,7 @@ Write-Log "--------------------------- PROFILS INCONNUS / NON RESOLUS ----------
 Write-Log "Nombre de profils inconnus détectés : $(($UnknownProfiles | Measure-Object).Count)"
 
 foreach ($profile in $UnknownProfiles) {
-    Write-Log "Profil inconnu ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)" "WARN"
+    Write-Log "Profil inconnu ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)" "WARNING"
 }
 
 Write-Log ""
@@ -228,37 +355,39 @@ Write-Log "--------------------------- PROFILS UTILISATEURS EXEMPTES -----------
 $ExemptProfiles = $AllProfiles | Where-Object {
     Test-ProtectedProfile `
         -ProfileDir $_.ProfileDir `
+        -Account $_.Account `
         -ProtectedPatterns $ProtectedProfiles
 }
 
-Write-Log "Nombre de profils exemptés : $(($ExemptProfiles | Measure-Object).Count)"
+Write-Log "Nombre de profils utilisateurs exemptés : $(($ExemptProfiles | Measure-Object).Count)"
 
 foreach ($profile in $ExemptProfiles) {
-    Write-Log "Profil exempté : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path)"
+    Write-Log "Profil utilisateur exempté : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path)"
 }
 
 Write-Log ""
 Write-Log "--------------------------- PROFILS CANDIDATS SUPPRESSION ------------------------------------------------"
 
-$CandidateProfiles = if ($DeleteLocalProfiles) {
-    $DomainProfiles + $LocalProfiles
-}
-else {
-    $DomainProfiles
-}
+$CandidateProfiles = @(
+        $DomainProfiles
+        $CloudProfiles
+        )
+
+    if ($DeleteLocalProfiles) {  $CandidateProfiles += $LocalProfiles }
 
 $ProfilesToDelete = $CandidateProfiles | Where-Object {
     $_.LastLoadTime -and
     $_.LastLoadTime -lt $CutoffDate -and
     -not (Test-ProtectedProfile `
-    -ProfileDir $_.ProfileDir `
-    -ProtectedPatterns $ProtectedProfiles)
+        -ProfileDir $_.ProfileDir `
+        -Account $_.Account `
+        -ProtectedPatterns $ProtectedProfiles)
 }
 
 Write-Log "Nombre de profils candidats suppression : $(($ProfilesToDelete | Measure-Object).Count)"
 
 foreach ($profile in $ProfilesToDelete) {
-    Write-Log "Candidat suppression : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
+    Write-Log "Candidat suppression : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Profile=$($profile.ProfileDir) | SizeApproxMB=$($profile.ProfileSizeMB) | Path=$($profile.Path) | LastLoadTime=$(Get-ProfileAgeText -LastLoadTime $profile.LastLoadTime)"
 }
 
 
@@ -270,14 +399,14 @@ $ErrorCount   = 0
 Write-Log ""
 
 if (-not $ProfilesToDelete -or ($ProfilesToDelete | Measure-Object).Count -eq 0) {
-    Write-Log "Aucun profil éligible à la suppression - Remove-CimInstance non exécuté" "WARN"
+    Write-Log "Aucun profil éligible à la suppression - Remove-CimInstance non exécuté" "WARNING"
 }
 else {
     if ($SimulationMode) {
-        Write-Log "********************* SIMULATION *****************************" "WARN"
+        Write-Log "********************* SIMULATION *****************************" "WARNING"
     }
     else {
-        Write-Log "********************* EFFACEMENT *****************************" "WARN"
+        Write-Log "********************* EFFACEMENT *****************************" "INFO"
     }
 
     try {
@@ -295,34 +424,45 @@ else {
             $CimProfilesBySid[$cim.SID] = $cim
         }
     }
+# ----------------------------------------------------------START des gardes-fous -------------------------------
 
+    #on analyse et on met les gardes-fous
     foreach ($profile in $ProfilesToDelete) {
+        
+        if ($profile.Sid -notmatch '^S-1-5-21-.+-\d+$') {
+            Write-Log "Profil ignoré - SID non utilisateur standard : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARNING"
+            $SkippedCount++
+            continue      }
 
         if (-not $CimProfilesBySid.ContainsKey($profile.Sid)) {
-            Write-Log "Profil CIM introuvable : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARN"
+            Write-Log "Profil CIM introuvable : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARNING"
             $SkippedCount++
-            continue
-        }
+            continue      }
 
         $cimProfile = $CimProfilesBySid[$profile.Sid]
 
         if ($cimProfile.Special) {
-            Write-Log "Profil spécial ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARN"
+            Write-Log "Profil spécial ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARNING"
             $SkippedCount++
-            continue
-        }
+            continue      }
+
+
+        if ($profile.Path -notlike "$env:SystemDrive\Users\*") {
+            Write-Log "Profil hors chemin standard ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARNING"
+            $SkippedCount++
+            continue      }
 
         if ($cimProfile.Loaded) {
-            Write-Log "Profil chargé/en cours d'utilisation ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARN"
+            Write-Log "Profil chargé/en cours d'utilisation ignoré : User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)" "WARNING"
             $SkippedCount++
-            continue
-        }
+            continue      }
 
         if ($SimulationMode) {
             Write-Log "SIMULATION - Profil qui serait supprimé : Type=$($profile.AccountType) | User=$($profile.Account) | SID=$($profile.Sid) | Path=$($profile.Path)"
             $SkippedCount++
-            continue
-        }
+            continue        }
+# ----------------------------------------------------------END des gardes-fous -------------------------------
+        #si aucun garde fou n'arrête -> GO pour la suppression
 
         try {
             Write-Log ""
@@ -342,11 +482,90 @@ else {
 }
 
 
-# BLOC5 -------------------------------------- FIN ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# BLOC5 -------------------------------------- NETTOYAGE PROFIL ORPHELIN AVEC REMOVE-ITEM ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-Write-Log "------------------------------------------------------------------------------------------------------------------ END script ------------------------------------------------------------------------------------------------------------------"
+Write-Log ""
+Write-Log "********************************************** DOSSIERS C:\USERS ORPHELINS avec Remove-Item **********************************************"
+Write-Log "Nombre de dossiers C:\Users sans référence registre : $(($OrphanUserFolders | Measure-Object).Count)"
+Write-Log "Nettoyage dossiers orphelins activé : $CleanOrphanProfiles"
+Write-Log ""
 
-if ($ErrorCount -gt 0) {
+if ($SimulationMode) {
+    Write-Log "********************* SIMULATION *****************************" "WARNING"
+}
+else {
+    Write-Log "********************* EFFACEMENT *****************************" "INFO"
+}
+
+Write-Log "Patterns dossiers orphelins protégés : $($ProtectedOrphanFolders -join ', ')"
+
+$OrphanDeletedCount   = 0
+$OrphanSimulatedCount = 0
+$OrphanExemptedCount  = 0
+$OrphanDetectedCount  = 0
+$OrphanErrorCount     = 0
+
+foreach ($folder in $OrphanUserFolders) {
+
+    # Protection reparse point / junction / symlink
+    if ($folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Write-Log "Dossier orphelin ignoré - reparse point/junction/symlink : Folder=$($folder.Name)  | SizeApproxMB=$folderSizeMB | Path=$($folder.FullName) | Path=$($folder.FullName)" "INFO"
+        $OrphanExemptedCount++
+        continue    }
+
+    # Protection chemin parent inattendu
+    if ((Split-Path -Path $folder.FullName -Parent) -ne "$env:SystemDrive\Users") {
+        Write-Log "Dossier orphelin ignoré - parent inattendu : Folder=$($folder.Name) | Path=$($folder.FullName) | SizeApproxMB=$folderSizeMB | Path=$($folder.FullName) " "WARNING"
+        $OrphanExemptedCount++
+        continue   }
+
+    if ($CalculateProfileSize) {
+        $folderSizeMB = Get-ProfileSizeMB `
+            -Path $folder.FullName `
+            -MaxSeconds $MaxSeconds  }
+
+    else { $folderSizeMB = $null  }
+
+    $isProtectedOrphan = Test-ProtectedOrphanFolder `
+        -FolderName $folder.Name `
+        -ProtectedPatterns $ProtectedOrphanFolders
+
+    if ($isProtectedOrphan) {
+        Write-Log "Dossier orphelin exempté : Folder=$($folder.Name) | SizeApproxMB=$folderSizeMB | Path=$($folder.FullName)" "INFO"
+        $OrphanExemptedCount++
+        continue   }
+
+    if (-not $CleanOrphanProfiles) {
+        Write-Log "Dossier orphelin détecté - fonction clean Orphan désactivée : Folder=$($folder.Name) | SizeApproxMB=$folderSizeMB | Path=$($folder.FullName) | LastWriteTime=$($folder.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"))" "INFO"
+        $OrphanDetectedCount++
+        continue   }
+
+    if ($SimulationMode) {
+        Write-Log "SIMULATION - Dossier orphelin qui serait supprimé : Folder=$($folder.Name) | SizeApproxMB=$folderSizeMB | Path=$($folder.FullName)" "INFO"
+        $OrphanSimulatedCount++
+        continue   }
+
+    try {
+        Write-Log "Suppression dossier orphelin : Folder=$($folder.Name) | SizeApproxMB=$folderSizeMB | Path=$($folder.FullName)" "WARNING"
+
+        Remove-Item -LiteralPath $folder.FullName -Recurse -Force -ErrorAction Stop
+
+        Write-Log "Dossier orphelin supprimé : Folder=$($folder.Name) | Path=$($folder.FullName)"
+        $OrphanDeletedCount++    }
+
+    catch {
+        Write-Log "Erreur suppression dossier orphelin : Folder=$($folder.Name) | Path=$($folder.FullName) | $($_.Exception.Message)" "ERROR"
+        $OrphanErrorCount++
+    } }
+
+if ($SimulationMode -and $CleanOrphanProfiles) {    Write-Log "SIMULATION - Résumé dossiers orphelins : Suppressions simulées=$OrphanSimulatedCount | Exemptés=$OrphanExemptedCount | Erreurs=$OrphanErrorCount" "WARNING"}
+
+else {    Write-Log "Résumé dossiers orphelins : Détectés=$OrphanDetectedCount | Supprimés=$OrphanDeletedCount | Exemptés=$OrphanExemptedCount | Erreurs=$OrphanErrorCount"}
+
+# BLOC6 -------------------------------------- Fin  ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Write-Log "------------------------------------------------------------------------------------------------------------------ END script + logging ------------------------------------------------------------------------------------------------------------------"
+
+if (($ErrorCount -gt 0) -or ($OrphanErrorCount -gt 0)) {
     exit 1
 }
 
