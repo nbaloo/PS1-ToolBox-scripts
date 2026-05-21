@@ -1,0 +1,48 @@
+# ====================================================================
+# QD - Lecture dates emails dans un PST via Outlook
+# ====================================================================
+
+$PstPath = "C:\Temp\archive.pst"
+
+$Outlook = New-Object -ComObject Outlook.Application
+$Namespace = $Outlook.GetNamespace("MAPI")
+
+$Namespace.AddStore($PstPath)
+
+$PstRoot = $Namespace.Folders | Where-Object {
+    $_.Store.FilePath -eq $PstPath
+}
+
+$Results = New-Object System.Collections.ArrayList
+
+function Read-Folder {
+    param($Folder)
+
+    foreach ($Item in $Folder.Items) {
+        if ($Item.MessageClass -like "IPM.Note*") {
+
+            [void]$Results.Add([PSCustomObject]@{
+                Folder       = $Folder.FolderPath
+                Subject      = $Item.Subject
+                Sender       = $Item.SenderName
+                ReceivedTime = $Item.ReceivedTime
+                SentOn       = $Item.SentOn
+            })
+        }
+    }
+
+    foreach ($SubFolder in $Folder.Folders) {
+        Read-Folder -Folder $SubFolder
+    }
+}
+
+Read-Folder -Folder $PstRoot
+
+$Results |
+Sort-Object ReceivedTime |
+Select-Object Folder, ReceivedTime, SentOn, Sender, Subject |
+Format-Table -AutoSize
+write-host "*/*/*/*/*/*/*/*/*/*/*/*/*/**/*//*/"
+
+$Results |
+Measure-Object ReceivedTime -Minimum -Maximum
