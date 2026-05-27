@@ -15,7 +15,7 @@ try {
 }
 catch {
     Write-Host "❌ Erreur lors de la lecture du dossier : $($_.Exception.Message)" -ForegroundColor Red
-    return
+    continue
 }
 
 $CountTooLong = 0
