@@ -1,0 +1,75 @@
+# ====================================================================
+# GRUBER NICOLAS 29.05.2026
+# QD - Capture connexions TCP ciblées - Debug live
+# ====================================================================
+
+$DurationSeconds = 30
+$IntervalSeconds = 1
+
+# Filtres optionnels
+$ProcessName = ""          # Exemple: "msedge", "outlook", "CiscoCollabHost"
+$RemoteIP    = ""          # Exemple: "10.20.30.40"
+
+
+
+
+
+$OutputFolder = "C:\Temp\CaptureNETSTAT"
+
+if (!(Test-Path $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+$OutputCsv = Join-Path $OutputFolder "CaptureTCP_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$EndTime = (Get-Date).AddSeconds($DurationSeconds)
+
+Write-Host "Capture TCP live -> $OutputCsv" -ForegroundColor Cyan
+
+while ((Get-Date) -lt $EndTime) {
+
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $Connections = Get-NetTCPConnection -ErrorAction SilentlyContinue
+
+    if (![string]::IsNullOrWhiteSpace($ProcessName)) {
+        $Pids = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Id
+
+        $Connections = $Connections | Where-Object {
+            $_.OwningProcess -in $Pids
+        }
+    }
+
+    if (![string]::IsNullOrWhiteSpace($RemoteIP)) {
+        $Connections = $Connections | Where-Object {
+            $_.RemoteAddress -eq $RemoteIP
+        }
+    }
+
+    $Rows = foreach ($Conn in $Connections) {
+        $Proc = Get-Process -Id $Conn.OwningProcess -ErrorAction SilentlyContinue
+
+        [PSCustomObject]@{
+            Timestamp     = $Timestamp
+            ProcessName   = $Proc.ProcessName
+            PID           = $Conn.OwningProcess
+            State         = $Conn.State
+            LocalAddress  = $Conn.LocalAddress
+            LocalPort     = $Conn.LocalPort
+            RemoteAddress = $Conn.RemoteAddress
+            RemotePort    = $Conn.RemotePort
+        }
+    }
+
+    if ($Rows) {
+        $Rows | Sort-Object RemoteAddress, RemotePort | Format-Table -AutoSize
+        $Rows | Export-Csv -Path $OutputCsv -Append -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        Write-Host "$Timestamp - aucune connexion TCP trouvée" -ForegroundColor DarkGray
+    }
+
+    Start-Sleep -Seconds $IntervalSeconds
+}
+
+Write-Host "Capture terminée : $OutputCsv" -ForegroundColor Green
