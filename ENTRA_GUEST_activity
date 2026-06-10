@@ -1,0 +1,171 @@
+# ====================================================================
+# Bloc 1 - Paramètres
+# ====================================================================
+
+$ExportFolder = Join-Path $PSScriptRoot "LOGS\"
+
+$DateStamp = Get-Date -Format "ddMMyyyy"
+
+$CsvPath      = Join-Path $ExportFolder "${DateStamp}_Guest_Inactivity_Audit.csv"
+
+$DisableTxt = Join-Path $ExportFolder "${DateStamp}_Guests_To_Disable_6Months.txt"
+$DeleteTxt  = Join-Path $ExportFolder "${DateStamp}_Guests_To_Delete_12Months.txt"
+
+
+$OldMonths    = 6  # then disable account
+$DeleteMonths = 12 # to delete account if account is disable
+
+New-Item -Path $ExportFolder -ItemType Directory -Force | Out-Null
+
+# ====================================================================
+# Bloc 2 - Vérification connexion Graph existante
+# ====================================================================
+
+$Context = Get-MgContext
+
+if (-not $Context)
+{
+    Write-Host "ERREUR : aucune connexion Graph active." -ForegroundColor Red
+    Write-Host "Lance d'abord ton script de connexion App-Only, puis relance ce script." -ForegroundColor Yellow
+    return
+}
+
+Write-Host "Connexion Graph active détectée." -ForegroundColor Green
+Write-Host "TenantId : $($Context.TenantId)"
+Write-Host "ClientId : $($Context.ClientId)"
+# ====================================================================
+# Bloc 3 - Récupération des Guests
+# ====================================================================
+
+$Guests = Get-MgUser `
+    -Filter "userType eq 'Guest'" `
+    -All `
+    -Property "id,displayName,userPrincipalName,mail,userType,accountEnabled,createdDateTime,externalUserState,signInActivity"
+
+$Now = Get-Date
+
+# ====================================================================
+# Bloc 4 - Analyse inactivité
+# ====================================================================
+
+$Report = foreach ($Guest in $Guests)
+{
+    $LastInteractive    = $Guest.SignInActivity.LastSignInDateTime
+    $LastNonInteractive = $Guest.SignInActivity.LastNonInteractiveSignInDateTime
+
+    $LastActivity = @(
+        $LastInteractive
+        $LastNonInteractive
+    ) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+
+    if (-not $LastActivity)
+    {
+        $LastActivity = $Guest.CreatedDateTime
+        $ActivitySource = "CreatedDateTime fallback"
+    }
+    else
+    {
+        $ActivitySource = "SignInActivity"
+    }
+
+    $InactiveDays = if ($LastActivity) {
+        [int](New-TimeSpan -Start $LastActivity -End $Now).TotalDays
+    }
+    else {
+        $null
+    }
+
+    $IsOld      = $InactiveDays -ge ($OldMonths * 30)
+    $IsToDelete = $InactiveDays -ge ($DeleteMonths * 30)
+
+    [PSCustomObject]@{
+        DisplayName       = $Guest.DisplayName
+        UserPrincipalName = $Guest.UserPrincipalName
+        Mail              = $Guest.Mail
+        Id                = $Guest.Id
+        AccountEnabled    = $Guest.AccountEnabled
+        ExternalState     = $Guest.ExternalUserState
+        CreatedDateTime   = $Guest.CreatedDateTime
+        LastInteractive   = $LastInteractive
+        LastNonInteractive= $LastNonInteractive
+        LastActivity      = $LastActivity
+        ActivitySource    = $ActivitySource
+        InactiveDays      = $InactiveDays
+        OLD               = $IsOld
+        ToDelete          = $IsToDelete
+    }
+}
+
+# ====================================================================
+# Bloc 5 - Export CSV complet
+# ====================================================================
+
+$Report |
+    Sort-Object `
+        @{Expression='ToDelete';Descending=$true},
+        @{Expression='OLD';Descending=$true},
+        @{Expression='InactiveDays';Descending=$true} |
+    Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+# ====================================================================
+# Bloc 6 - Export TXT DISABLE + DELETE
+# ====================================================================
+
+$ToDisableGuests = $Report | Where-Object {
+    $_.OLD -eq $true -and
+    $_.AccountEnabled -eq $true
+}
+
+$ToDeleteGuests = $Report | Where-Object {
+    $_.ToDelete -eq $true -and
+    $_.AccountEnabled -eq $false
+}
+
+# --- TXT DISABLE 6 mois ---
+
+$DisableContent = @()
+$DisableContent += "# Guests inactifs depuis plus de $OldMonths mois"
+$DisableContent += "# Action proposée : DISABLE + notification"
+$DisableContent += "# Généré le : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$DisableContent += "# Total Guests : $($Report.Count)"
+$DisableContent += "# Guests à désactiver : $($ToDisableGuests.Count)"
+$DisableContent += ""
+
+foreach ($Guest in $ToDisableGuests)
+{
+    $DisableContent += "# $($Guest.DisplayName) | $($Guest.UserPrincipalName) | Mail: $($Guest.Mail) | Enabled: $($Guest.AccountEnabled) | Inactif $($Guest.InactiveDays) jours | LastActivity: $($Guest.LastActivity)"
+    $DisableContent += "Update-MgUser -UserId '$($Guest.Id)' -AccountEnabled:`$false"
+    $DisableContent += ""
+}
+
+$DisableContent | Out-File -FilePath $DisableTxt -Encoding UTF8
+
+
+# --- TXT DELETE 12 mois ---
+
+$DeleteContent = @()
+$DeleteContent += "# Guests inactifs depuis plus de $DeleteMonths mois"
+$DeleteContent += "# Action proposée : DELETE uniquement si compte déjà DISABLED"
+$DeleteContent += "# Généré le : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$DeleteContent += "# Total Guests : $($Report.Count)"
+$DeleteContent += "# Guests à supprimer : $($ToDeleteGuests.Count)"
+$DeleteContent += ""
+
+foreach ($Guest in $ToDeleteGuests)
+{
+    $DeleteContent += "# $($Guest.DisplayName) | $($Guest.UserPrincipalName) | Mail: $($Guest.Mail) | Enabled: $($Guest.AccountEnabled) | Inactif $($Guest.InactiveDays) jours | LastActivity: $($Guest.LastActivity)"
+    $DeleteContent += "Remove-MgUser -UserId '$($Guest.Id)' -Confirm:`$true"
+    $DeleteContent += ""
+}
+
+$DeleteContent | Out-File -FilePath $DeleteTxt -Encoding UTF8
+
+# ====================================================================
+# Bloc 7 - Résumé
+# ====================================================================
+
+Write-Host "Total Guests analysés : $($Report.Count)" -ForegroundColor Cyan
+Write-Host "Export CSV complet : $CsvPath" -ForegroundColor Green
+Write-Host "Export TXT DISABLE 6 mois : $DisableTxt" -ForegroundColor Yellow
+Write-Host "Export TXT DELETE 12 mois : $DeleteTxt" -ForegroundColor Red
+Write-Host "Guests à désactiver : $($ToDisableGuests.Count)" -ForegroundColor Yellow
+Write-Host "Guests à supprimer : $($ToDeleteGuests.Count)" -ForegroundColor Red
